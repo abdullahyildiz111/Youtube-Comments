@@ -1,0 +1,14 @@
+providers = ["node"]
+
+[variables]
+NIXPACKS_NODE_VERSION = "22"
+NODE_ENV = "production"
+
+[phases.install]
+cmds = ["npm ci --prefix backend"]
+
+[phases.build]
+cmds = ["npm run build --prefix backend"]
+
+[start]
+cmd = "node backend/dist/index.js"

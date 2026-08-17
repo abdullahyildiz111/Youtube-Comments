@@ -1,0 +1,12 @@
+node_modules
+backend/node_modules
+backend/dist
+dist
+.env
+**/.env
+**/.env.*
+!**/.env.example
+.git
+.output
+.wxt
+*.log

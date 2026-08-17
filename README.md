@@ -59,12 +59,21 @@ Use `npm run build` to create a production Chromium build in `.output/`.
 
 ## Deploy on Coolify
 
+Coolify must build the API, not the Chrome extension. In the application
+**Build** settings:
+
+- Build pack: **Dockerfile** (not Nixpacks)
+- Base directory: `/` (repo root)
+- Dockerfile: `Dockerfile`
+- Port: `3000`
+
+If Coolify stays on Nixpacks, `nixpacks.toml` still builds `backend/` instead
+of the extension.
+
+Then:
+
 1. Push this repository to GitHub/GitLab, or point Coolify at the local repo.
-2. Create a new Coolify application:
-   - Build pack: Dockerfile
-   - Dockerfile location: `backend/Dockerfile`
-   - Docker build context: `backend`
-   - Port: `3000`
+2. Create a new Coolify application with the build settings above.
 3. Add these environment variables in Coolify:
 
 ```dotenv
