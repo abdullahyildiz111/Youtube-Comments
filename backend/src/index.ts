@@ -37,9 +37,11 @@ loadLocalEnv();
 const GEMINI_API_BASE =
   'https://generativelanguage.googleapis.com/v1beta/models';
 const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
-const MAX_REQUEST_CHARACTERS = 650_000;
-const MAX_COMMENTS = 5_000;
+const MAX_REQUEST_CHARACTERS = 3_000_000;
+const MAX_COMMENTS = 10_000;
 const MAX_COMMENT_CHARACTERS = 10_000;
+const CHUNK_CHARACTERS = 150_000;
+const CHUNK_COMMENTS = 1_500;
 const GEMINI_TIMEOUT_MS = 45_000;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
@@ -283,16 +285,42 @@ function normalizeParagraph(value: string): string {
     .trim();
 }
 
-function buildPrompt(request: SummaryRequest): string {
-  const commentLines = request.comments
+function chunkComments(comments: IncomingComment[]): IncomingComment[][] {
+  const chunks: IncomingComment[][] = [];
+  let current: IncomingComment[] = [];
+  let characters = 0;
+
+  for (const comment of comments) {
+    const nextSize = characters + comment.text.length;
+    if (
+      current.length > 0 &&
+      (current.length >= CHUNK_COMMENTS || nextSize > CHUNK_CHARACTERS)
+    ) {
+      chunks.push(current);
+      current = [];
+      characters = 0;
+    }
+
+    current.push(comment);
+    characters += comment.text.length;
+  }
+
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+function commentsBlock(comments: IncomingComment[], startIndex = 1): string {
+  return comments
     .map(
       (comment, index) =>
-        `${index + 1}. ${comment.isReply ? '[reply] ' : ''}${JSON.stringify(
+        `${startIndex + index}. ${comment.isReply ? '[reply] ' : ''}${JSON.stringify(
           comment.text,
         )}`,
     )
     .join('\n');
+}
 
+function buildPrompt(request: SummaryRequest): string {
   return [
     `Video title: ${JSON.stringify(request.videoTitle)}`,
     `Captured comments: ${request.comments.length}`,
@@ -300,18 +328,54 @@ function buildPrompt(request: SummaryRequest): string {
     'Summarize the complete discussion below. Reflect recurring themes, overall sentiment, consensus, and meaningful disagreements. Weight repeated opinions appropriately, do not invent facts, do not name individual commenters, and return exactly one concise paragraph in the primary language used by the comments.',
     '',
     '<comments>',
-    commentLines,
+    commentsBlock(request.comments),
     '</comments>',
   ].join('\n');
 }
 
-async function requestGeminiSummary(
+function buildChunkPrompt(
   request: SummaryRequest,
-): Promise<{ summary: string; model: string }> {
-  const configuredModel = process.env.GEMINI_MODEL?.trim() || DEFAULT_MODEL;
-  const model = /^[a-zA-Z0-9._-]+$/.test(configuredModel)
-    ? configuredModel
-    : DEFAULT_MODEL;
+  chunk: IncomingComment[],
+  chunkIndex: number,
+  chunkCount: number,
+  startIndex: number,
+): string {
+  return [
+    `Video title: ${JSON.stringify(request.videoTitle)}`,
+    `This is part ${chunkIndex + 1} of ${chunkCount} from a thread of ${request.comments.length} comments.`,
+    '',
+    'Summarize only this portion. Reflect recurring themes, overall sentiment, consensus, and meaningful disagreements. Do not invent facts, do not name individual commenters, and return exactly one concise paragraph in the primary language used by the comments.',
+    '',
+    '<comments>',
+    commentsBlock(chunk, startIndex),
+    '</comments>',
+  ].join('\n');
+}
+
+function buildMergePrompt(
+  request: SummaryRequest,
+  partials: string[],
+): string {
+  const summaryLines = partials
+    .map((partial, index) => `${index + 1}. ${JSON.stringify(partial)}`)
+    .join('\n');
+
+  return [
+    `Video title: ${JSON.stringify(request.videoTitle)}`,
+    `These notes cover ${request.comments.length} YouTube comments in ${partials.length} parts.`,
+    '',
+    'Combine the notes into exactly one concise paragraph that reflects the overall discussion: recurring themes, sentiment, consensus, and meaningful disagreements. Weight repeated opinions appropriately, do not invent facts, do not name individual commenters, and use the primary language used by the comments.',
+    '',
+    '<notes>',
+    summaryLines,
+    '</notes>',
+  ].join('\n');
+}
+
+async function generateParagraph(
+  prompt: string,
+  model: string,
+): Promise<string> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
 
@@ -335,7 +399,7 @@ async function requestGeminiSummary(
           contents: [
             {
               role: 'user',
-              parts: [{ text: buildPrompt(request) }],
+              parts: [{ text: prompt }],
             },
           ],
           generationConfig: {
@@ -373,10 +437,44 @@ async function requestGeminiSummary(
       throw new Error('GEMINI_EMPTY_RESPONSE');
     }
 
-    return { summary, model };
+    return summary;
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function requestGeminiSummary(
+  request: SummaryRequest,
+): Promise<{ summary: string; model: string }> {
+  const configuredModel = process.env.GEMINI_MODEL?.trim() || DEFAULT_MODEL;
+  const model = /^[a-zA-Z0-9._-]+$/.test(configuredModel)
+    ? configuredModel
+    : DEFAULT_MODEL;
+
+  const chunks = chunkComments(request.comments);
+  if (chunks.length <= 1) {
+    return {
+      summary: await generateParagraph(buildPrompt(request), model),
+      model,
+    };
+  }
+
+  const partials: string[] = [];
+  let startIndex = 1;
+  for (const [index, chunk] of chunks.entries()) {
+    partials.push(
+      await generateParagraph(
+        buildChunkPrompt(request, chunk, index, chunks.length, startIndex),
+        model,
+      ),
+    );
+    startIndex += chunk.length;
+  }
+
+  return {
+    summary: await generateParagraph(buildMergePrompt(request, partials), model),
+    model,
+  };
 }
 
 function isTimeoutError(error: unknown): boolean {

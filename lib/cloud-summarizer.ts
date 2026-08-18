@@ -1,7 +1,9 @@
 import type { YouTubeComment } from '@/lib/comments';
 
 const LOCAL_API_URL = 'http://localhost:3000/summarize';
-const REQUEST_TIMEOUT_MS = 60_000;
+const REQUEST_TIMEOUT_MS = 180_000;
+
+export const SUMMARIZE_MESSAGE = 'comment-catcher:summarize' as const;
 
 interface SummaryApiResponse {
   summary?: string;
@@ -16,10 +18,36 @@ export interface CloudSummary {
   model: string;
 }
 
+export interface SummarizeRequest {
+  type: typeof SUMMARIZE_MESSAGE;
+  videoId: string;
+  videoTitle: string;
+  comments: Array<{ text: string; isReply: boolean }>;
+}
+
+type SummarizeResponse =
+  | { ok: true; summary: CloudSummary }
+  | {
+      ok: false;
+      errorMessage: string;
+      errorName?: string;
+      status?: number;
+    };
+
 export class SummaryBackendNotConfiguredError extends Error {
   constructor() {
     super('The summary backend URL is not configured.');
     this.name = 'SummaryBackendNotConfiguredError';
+  }
+}
+
+export class CloudSummaryRequestError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'CloudSummaryRequestError';
   }
 }
 
@@ -38,8 +66,8 @@ function getSummaryApiUrl(): string {
   }
 }
 
-export async function summarizeCommentsInCloud(
-  comments: YouTubeComment[],
+export async function performSummaryFetch(
+  comments: Array<{ text: string; isReply: boolean }>,
   videoId: string,
   videoTitle: string,
 ): Promise<CloudSummary> {
@@ -48,7 +76,7 @@ export async function summarizeCommentsInCloud(
   }
 
   const controller = new AbortController();
-  const timeout = window.setTimeout(
+  const timeout = globalThis.setTimeout(
     () => controller.abort(),
     REQUEST_TIMEOUT_MS,
   );
@@ -68,10 +96,7 @@ export async function summarizeCommentsInCloud(
       body: JSON.stringify({
         videoId,
         videoTitle,
-        comments: comments.map((comment) => ({
-          text: comment.text,
-          isReply: comment.isReply,
-        })),
+        comments,
       }),
       signal: controller.signal,
     });
@@ -104,18 +129,49 @@ export async function summarizeCommentsInCloud(
       model: payload.model || 'Gemini Flash-Lite',
     };
   } finally {
-    window.clearTimeout(timeout);
+    globalThis.clearTimeout(timeout);
   }
 }
 
-class CloudSummaryRequestError extends Error {
-  constructor(
-    readonly status: number,
-    message: string,
-  ) {
-    super(message);
-    this.name = 'CloudSummaryRequestError';
+export async function summarizeCommentsInCloud(
+  comments: YouTubeComment[],
+  videoId: string,
+  videoTitle: string,
+): Promise<CloudSummary> {
+  const request: SummarizeRequest = {
+    type: SUMMARIZE_MESSAGE,
+    videoId,
+    videoTitle,
+    comments: comments.map((comment) => ({
+      text: comment.text,
+      isReply: comment.isReply,
+    })),
+  };
+
+  const response = (await browser.runtime.sendMessage(
+    request,
+  )) as SummarizeResponse | undefined;
+
+  if (!response) {
+    throw new TypeError('The summary backend could not be reached.');
   }
+
+  if (response.ok) return response.summary;
+
+  if (response.errorName === 'SummaryBackendNotConfiguredError') {
+    throw new SummaryBackendNotConfiguredError();
+  }
+
+  if (typeof response.status === 'number') {
+    throw new CloudSummaryRequestError(response.status, response.errorMessage);
+  }
+
+  if (response.errorName === 'AbortError') {
+    const error = new DOMException(response.errorMessage, 'AbortError');
+    throw error;
+  }
+
+  throw new Error(response.errorMessage);
 }
 
 export function getCloudSummaryErrorMessage(error: unknown): string {

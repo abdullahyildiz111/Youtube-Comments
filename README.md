@@ -31,24 +31,36 @@ npm run backend:dev
 npm run dev
 ```
 
-WXT opens a browser with the extension installed. Open a YouTube video, scroll
-to its comments, then use **Summarize all comments**.
+WXT opens a browser with the extension installed. Open a YouTube video, then
+use **Load all comments** or **Summarize all comments**. Refresh the YouTube
+tab once after installing or updating the extension.
 
 Use `npm run build` to create a production Chromium build in `.output/`.
 
 ## Current collection behavior
 
 - No YouTube API key is required.
-- The content script watches YouTube's comments DOM and captures top-level
-  comments and loaded replies.
-- YouTube lazy-loads comments, so the extension collects more as the user
-  scrolls. It does not claim that the captured set contains every comment on
-  the video.
+- **Load all comments** asks YouTube for the comment thread directly, so you
+  do not need to scroll the page. The same action runs automatically before
+  **Summarize all comments**.
+- Replies are loaded in small parallel batches after the main thread. The
+  fetch is capped at 2,000 comments.
+- YouTube's on-page total is an estimate. Hidden, held-for-review, and some
+  low-ranked comments are often never returned.
+- These requests use the same YouTube session as the tab. Loading one video is
+  similar to scrolling the comments section quickly. Do not hammer many videos
+  in a row.
+- Visible comments on the page are still captured in the background and merged
+  into the same list.
+- Turn on **Auto** in the popup to fetch and summarize each new video as it
+  opens. Open the popup to read the paragraph. Leave Auto off to summarize
+  only when you click the button.
 - Navigation between videos is handled without requiring a full page reload.
 
 ## Cloud AI summaries
 
-- Select **Summarize all comments** in the popup after comments are captured.
+- Select **Summarize all comments** in the popup. The extension loads the
+  thread from YouTube first, then sends that set to Gemini.
 - The extension sends only the video ID, title, comment text, and reply flags.
 - The Gemini key lives only on the VPS as a Coolify environment variable. It
   is never bundled into the extension.

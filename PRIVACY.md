@@ -1,6 +1,7 @@
 # Privacy
 
-Comment Catcher reads comments that YouTube has loaded in the active video tab.
+Comment Catcher can read comments already painted on a YouTube video page and
+can also request the comment thread from YouTube so you do not have to scroll.
 It does not transmit anything until the user selects **Summarize all comments**.
 
 ## Data sent for a summary

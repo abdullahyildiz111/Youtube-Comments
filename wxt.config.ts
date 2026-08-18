@@ -25,7 +25,7 @@ export default defineConfig({
   manifest: ({ browser }) => ({
     name: 'Comment Catcher for YouTube',
     description:
-      'Collect and summarize comments loaded on a YouTube video page.',
+      'Collect YouTube comment threads and summarize them with Gemini.',
     permissions: ['activeTab', 'storage'],
     host_permissions: summaryHostPermissions(),
     action: {
