@@ -3,6 +3,8 @@ import {
   COMMENT_MESSAGES,
   MAX_FETCHED_COMMENTS,
   MAX_SNAPSHOT_COMMENTS,
+  type ChatAboutCommentsResponse,
+  type CommentsPageResponse,
   type CommentsSnapshot,
   type CommentsUpdatedMessage,
   type LoadAllCommentsResponse,
@@ -10,6 +12,9 @@ import {
   type ScrollToCommentsResponse,
   type SummarizeLoadedResponse,
   getYouTubeVideoId,
+  groupCommentsForDisplay,
+  type CommentThread,
+  type YouTubeComment,
 } from '@/lib/comments';
 import { AUTO_SUMMARIZE_KEY, setAutoSummarizeEnabled } from '@/lib/settings';
 import {
@@ -17,9 +22,16 @@ import {
   readSummaryCache,
   type SavedSummary,
 } from '@/lib/summary-cache';
+import {
+  clearVideoChat,
+  readVideoChat,
+  saveVideoChat,
+  type ChatMessage,
+} from '@/lib/chat-cache';
+import { ChatPanel } from './ChatPanel';
 import './App.css';
 
-const MAX_VISIBLE_COMMENTS = MAX_SNAPSHOT_COMMENTS;
+const COMMENTS_PAGE_SIZE = MAX_SNAPSHOT_COMMENTS;
 
 type PopupState =
   | { kind: 'loading' }
@@ -78,6 +90,52 @@ function capturedCount(snapshot: CommentsSnapshot): number {
   return snapshot.capturedCount ?? snapshot.comments.length;
 }
 
+function listedThreadCount(snapshot: CommentsSnapshot): number {
+  return typeof snapshot.threadCount === 'number'
+    ? snapshot.threadCount
+    : groupCommentsForDisplay(snapshot.comments).length;
+}
+
+function repliesLabel(thread: CommentThread): string {
+  const listed = thread.parent.replyCount;
+  if (listed && listed !== '0') {
+    return listed === '1' ? '1 reply' : `${listed} replies`;
+  }
+  return thread.replies.length === 1
+    ? '1 reply'
+    : `${thread.replies.length} replies`;
+}
+
+function CommentCard({ comment }: { comment: YouTubeComment }) {
+  return (
+    <article
+      className={`comment-card${comment.isReply ? ' is-reply' : ''}`}
+    >
+      <div className="avatar" aria-hidden="true">
+        {comment.avatarUrl ? (
+          <img src={comment.avatarUrl} alt="" />
+        ) : (
+          comment.author.slice(0, 1).toUpperCase()
+        )}
+      </div>
+      <div className="comment-body">
+        <div className="comment-meta">
+          <strong>{comment.author}</strong>
+          {comment.publishedAt && <span>{comment.publishedAt}</span>}
+        </div>
+        <div className="badges">
+          {comment.isPinned && <span>Pinned</span>}
+          {comment.isCreatorHearted && <span>Creator heart</span>}
+        </div>
+        <p>{comment.text}</p>
+        <div className="comment-stats">
+          <span>{comment.likeCount ?? '0'} likes</span>
+        </div>
+      </div>
+    </article>
+  );
+}
+
 function formatCapturedAt(value: string | null): string | null {
   if (!value) return null;
 
@@ -98,7 +156,21 @@ function App() {
   });
   const [threadError, setThreadError] = useState<string | null>(null);
   const [autoSummarize, setAutoSummarize] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatSending, setChatSending] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
   const summaryRunId = useRef(0);
+  const summaryInFlightRef = useRef(false);
+  const listRef = useRef<HTMLDivElement>(null);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const loadingMoreRef = useRef(false);
+  const pageCommentsRef = useRef<YouTubeComment[]>([]);
+  const visibleCountRef = useRef(COMMENTS_PAGE_SIZE);
+  const [pageComments, setPageComments] = useState<YouTubeComment[]>([]);
+  const [visibleCount, setVisibleCount] = useState(COMMENTS_PAGE_SIZE);
+  const [expandedThreadIds, setExpandedThreadIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const activeVideoId =
     state.kind === 'ready' ? state.snapshot.videoId : null;
   const activeVideoIdRef = useRef(activeVideoId);
@@ -212,7 +284,21 @@ function App() {
   }, [activeVideoId]);
 
   useEffect(() => {
+    if (!activeVideoId) {
+      setChatMessages([]);
+      setChatError(null);
+      return;
+    }
+
+    void readVideoChat(activeVideoId).then((messages) => {
+      setChatMessages(messages);
+      setChatError(null);
+    });
+  }, [activeVideoId]);
+
+  useEffect(() => {
     if (state.kind !== 'ready') return;
+    if (summaryInFlightRef.current) return;
 
     const { snapshot } = state;
     const videoId = snapshot.videoId;
@@ -260,9 +346,11 @@ function App() {
     if (
       summaryState.kind === 'working' &&
       snapshot.autoPhase === 'idle' &&
-      videoId
+      videoId &&
+      summaryState.message.startsWith('Loading comments from YouTube')
     ) {
       void readSummaryCache().then((cache) => {
+        if (summaryInFlightRef.current) return;
         const cachedSummary = cache[videoId];
         if (cachedSummary) {
           setSummaryState({ kind: 'success', value: cachedSummary });
@@ -310,6 +398,7 @@ function App() {
     if (state.kind !== 'ready') return;
 
     if (count === 0) {
+      summaryInFlightRef.current = false;
       setSummaryState({
         kind: 'error',
         message: 'No comments were found to summarize.',
@@ -317,6 +406,7 @@ function App() {
       return;
     }
 
+    summaryInFlightRef.current = true;
     setSummaryState({
       kind: 'working',
       message: `Sending ${count} comments to the secure summary service…`,
@@ -345,6 +435,11 @@ function App() {
           kind: 'error',
           message: 'Refresh the YouTube tab, then try summarizing again.',
         });
+      })
+      .finally(() => {
+        if (summaryRunId.current === runId) {
+          summaryInFlightRef.current = false;
+        }
       });
   };
 
@@ -354,6 +449,11 @@ function App() {
     const { snapshot } = state;
     const videoId = snapshot.videoId;
     if (!videoId) return;
+
+    if (capturedCount(snapshot) > 0) {
+      summarizeCapturedComments();
+      return;
+    }
 
     const runId = ++summaryRunId.current;
     setSummaryState({
@@ -428,6 +528,7 @@ function App() {
 
   const summarizeCapturedComments = () => {
     if (state.kind !== 'ready') return;
+    if (summaryInFlightRef.current || summaryState.kind === 'working') return;
 
     const { snapshot } = state;
     const videoId = snapshot.videoId;
@@ -437,14 +538,183 @@ function App() {
     summarizeFromPage(++summaryRunId.current, count);
   };
 
-  const visibleComments = useMemo(() => {
-    if (state.kind !== 'ready') return [];
-    return state.snapshot.comments.slice(0, MAX_VISIBLE_COMMENTS);
+  const sendChatQuestion = async (question: string) => {
+    if (state.kind !== 'ready' || chatSending) return;
+    if (summaryState.kind === 'working') return;
+
+    const videoId = state.snapshot.videoId;
+    if (!videoId || capturedCount(state.snapshot) === 0) return;
+
+    const userMessage: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: 'user',
+      text: question,
+      createdAt: new Date().toISOString(),
+    };
+    const pending = [...chatMessages, userMessage];
+    setChatMessages(pending);
+    setChatSending(true);
+    setChatError(null);
+
+    try {
+      const response = (await browser.tabs.sendMessage(state.tabId, {
+        type: COMMENT_MESSAGES.chatAboutComments,
+        question,
+        history: chatMessages.map(({ role, text }) => ({ role, text })),
+      })) as ChatAboutCommentsResponse;
+
+      if (!response?.ok || !response.answer) {
+        setChatError(
+          response?.error || 'The comments could not be asked about.',
+        );
+        return;
+      }
+
+      const assistantMessage: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        text: response.answer,
+        createdAt: new Date().toISOString(),
+      };
+      const next = [...pending, assistantMessage];
+      setChatMessages(next);
+      await saveVideoChat(videoId, next);
+    } catch {
+      setChatError('Refresh the YouTube tab, then try asking again.');
+    } finally {
+      setChatSending(false);
+    }
+  };
+
+  const clearChat = () => {
+    if (state.kind !== 'ready' || !state.snapshot.videoId || chatSending) return;
+    setChatMessages([]);
+    setChatError(null);
+    void clearVideoChat(state.snapshot.videoId);
+  };
+
+  const streamKey =
+    state.kind === 'ready'
+      ? `${state.snapshot.videoId ?? ''}:${state.snapshot.comments[0]?.id ?? ''}`
+      : '';
+
+  useEffect(() => {
+    if (state.kind !== 'ready') {
+      setPageComments([]);
+      setVisibleCount(COMMENTS_PAGE_SIZE);
+      setExpandedThreadIds(new Set());
+      return;
+    }
+
+    setPageComments(state.snapshot.comments);
+    setVisibleCount(COMMENTS_PAGE_SIZE);
+    setExpandedThreadIds(new Set());
+  }, [streamKey]);
+
+  pageCommentsRef.current = pageComments;
+  visibleCountRef.current = visibleCount;
+
+  const refreshVisibleComments = useCallback(
+    async (limit: number) => {
+      if (state.kind !== 'ready') return;
+
+      try {
+        const response = (await browser.tabs.sendMessage(state.tabId, {
+          type: COMMENT_MESSAGES.getCommentsPage,
+          offset: 0,
+          limit,
+        })) as CommentsPageResponse;
+        if (response.videoId !== state.snapshot.videoId) return;
+        setPageComments(response.comments);
+      } catch {
+        // The popup can close or the tab can change while a page request is in flight.
+      }
+    },
+    [state],
+  );
+
+  useEffect(() => {
+    if (state.kind !== 'ready') return;
+    if (visibleCountRef.current > COMMENTS_PAGE_SIZE) {
+      void refreshVisibleComments(visibleCountRef.current);
+      return;
+    }
+    setPageComments(state.snapshot.comments);
+  }, [state, refreshVisibleComments]);
+
+  const loadMoreComments = useCallback(async () => {
+    if (state.kind !== 'ready' || loadingMoreRef.current) return;
+
+    const total = listedThreadCount(state.snapshot);
+    const visible = visibleCountRef.current;
+    if (visible >= total) return;
+
+    const nextVisible = Math.min(visible + COMMENTS_PAGE_SIZE, total);
+    loadingMoreRef.current = true;
+    try {
+      const response = (await browser.tabs.sendMessage(state.tabId, {
+        type: COMMENT_MESSAGES.getCommentsPage,
+        offset: 0,
+        limit: nextVisible,
+      })) as CommentsPageResponse;
+
+      if (response.videoId !== state.snapshot.videoId) return;
+      if (response.comments.length === 0) {
+        setVisibleCount(Math.min(visible, total));
+        return;
+      }
+
+      setPageComments(response.comments);
+      setVisibleCount(Math.min(nextVisible, response.total));
+    } catch {
+      // The popup can close or the tab can change while a page request is in flight.
+    } finally {
+      loadingMoreRef.current = false;
+    }
   }, [state]);
+
+  const canLoadMore =
+    state.kind === 'ready' && visibleCount < listedThreadCount(state.snapshot);
+
+  useEffect(() => {
+    const list = listRef.current;
+    const sentinel = sentinelRef.current;
+    if (!list || !sentinel || !canLoadMore) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          void loadMoreComments();
+        }
+      },
+      { root: list, rootMargin: '120px' },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [canLoadMore, loadMoreComments, pageComments.length, visibleCount]);
+
+  const visibleThreads = useMemo(() => {
+    const source =
+      pageComments.length > 0
+        ? pageComments
+        : state.kind === 'ready'
+          ? state.snapshot.comments
+          : [];
+    return groupCommentsForDisplay(source).slice(0, visibleCount);
+  }, [pageComments, visibleCount, state]);
+
+  const toggleThread = (id: string) => {
+    setExpandedThreadIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
 
   const isLoadingAll =
     state.kind === 'ready' && state.snapshot.status === 'loading-all';
-  const isBusy = isLoadingAll || summaryState.kind === 'working';
+  const isBusy = isLoadingAll || summaryState.kind === 'working' || chatSending;
   const commentsDisabled =
     state.kind === 'ready' && state.snapshot.status === 'no-comments';
   const loadedCountLabel =
@@ -641,20 +911,15 @@ function App() {
                       <div className="summary-error-actions">
                         <button
                           className="secondary-button"
-                          onClick={summarizeAllComments}
+                          onClick={
+                            capturedCount(state.snapshot) > 0
+                              ? summarizeCapturedComments
+                              : summarizeAllComments
+                          }
                           disabled={isBusy}
                         >
                           Try again
                         </button>
-                        {capturedCount(state.snapshot) > 0 && (
-                          <button
-                            className="text-button"
-                            onClick={summarizeCapturedComments}
-                            disabled={isBusy}
-                          >
-                            Summarize captured
-                          </button>
-                        )}
                       </div>
                     </div>
                   )}
@@ -677,8 +942,9 @@ function App() {
                         </span>
                         <button
                           className="text-button"
-                          onClick={summarizeAllComments}
-                          disabled={isBusy}
+                          onClick={summarizeCapturedComments}
+                          disabled={isBusy || capturedCount(state.snapshot) === 0}
+                          title="Summarize the comments already loaded"
                         >
                           Update
                         </button>
@@ -686,6 +952,26 @@ function App() {
                     </div>
                   )}
                 </section>
+
+                <ChatPanel
+                  disabled={
+                    capturedCount(state.snapshot) === 0 ||
+                    summaryState.kind === 'working' ||
+                    isLoadingAll
+                  }
+                  disabledReason={
+                    capturedCount(state.snapshot) === 0
+                      ? 'Load comments first to ask about this video.'
+                      : isLoadingAll || summaryState.kind === 'working'
+                        ? 'Wait until comments finish loading or summarizing.'
+                        : ''
+                  }
+                  sending={chatSending}
+                  error={chatError}
+                  messages={chatMessages}
+                  onSend={(question) => void sendChatQuestion(question)}
+                  onClear={clearChat}
+                />
 
                 {capturedCount(state.snapshot) === 0 && (
                   <section className="empty-state">
@@ -758,52 +1044,36 @@ function App() {
                   </div>
                   {threadError && <p className="thread-error">{threadError}</p>}
 
-                  <div className="comment-list">
-                    {visibleComments.map((comment) => (
-                      <article
-                        className={`comment-card${
-                          comment.isReply ? ' is-reply' : ''
-                        }`}
-                        key={comment.id}
-                      >
-                        <div className="avatar" aria-hidden="true">
-                          {comment.avatarUrl ? (
-                            <img src={comment.avatarUrl} alt="" />
-                          ) : (
-                            comment.author.slice(0, 1).toUpperCase()
-                          )}
-                        </div>
-                        <div className="comment-body">
-                          <div className="comment-meta">
-                            <strong>{comment.author}</strong>
-                            {comment.publishedAt && (
-                              <span>{comment.publishedAt}</span>
-                            )}
-                          </div>
-                          <div className="badges">
-                            {comment.isPinned && <span>Pinned</span>}
-                            {comment.isCreatorHearted && (
-                              <span>Creator heart</span>
-                            )}
-                            {comment.isReply && <span>Reply</span>}
-                          </div>
-                          <p>{comment.text}</p>
-                          {comment.likeCount && (
-                            <span className="like-count">
-                              ▲ {comment.likeCount}
-                            </span>
-                          )}
-                        </div>
-                      </article>
-                    ))}
-                  </div>
+                  <div className="comment-list" ref={listRef}>
+                    {visibleThreads.map((thread) => {
+                      const expanded = expandedThreadIds.has(thread.parent.id);
+                      const canShowReplies = thread.replies.length > 0;
 
-                  {capturedCount(state.snapshot) > MAX_VISIBLE_COMMENTS && (
-                    <p className="list-limit">
-                      Showing the first {MAX_VISIBLE_COMMENTS} of{' '}
-                      {capturedCount(state.snapshot)} loaded comments.
-                    </p>
-                  )}
+                      return (
+                        <div className="comment-thread" key={thread.parent.id}>
+                          <CommentCard comment={thread.parent} />
+                          {canShowReplies && (
+                            <button
+                              type="button"
+                              className="replies-toggle"
+                              onClick={() => toggleThread(thread.parent.id)}
+                            >
+                              {expanded
+                                ? 'Hide replies'
+                                : `View ${repliesLabel(thread)}`}
+                            </button>
+                          )}
+                          {expanded &&
+                            thread.replies.map((reply) => (
+                              <CommentCard comment={reply} key={reply.id} />
+                            ))}
+                        </div>
+                      );
+                    })}
+                    {canLoadMore && (
+                      <div ref={sentinelRef} className="list-sentinel" />
+                    )}
+                  </div>
                 </section>
                 )}
               </>
@@ -815,7 +1085,7 @@ function App() {
       <footer>
         <span>Fast summaries powered by Gemini</span>
         <span className="footer-dot">•</span>
-        <span>Search is next</span>
+        <span>Ask the comments anything</span>
       </footer>
     </div>
   );

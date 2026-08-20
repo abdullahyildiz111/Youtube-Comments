@@ -117,13 +117,14 @@ export default defineContentScript({
       const isCancelled = () => activeRequestId !== requestId;
 
       void fetchAllVideoComments(
-        (count, totalCommentsLabel) => {
+        (count, totalCommentsLabel, added) => {
           if (isCancelled()) return;
           if (totalCommentsLabel) postCount(videoId, totalCommentsLabel);
           const progress: LoadAllProgress = {
             type: INNERTUBE_BRIDGE.progress,
             requestId,
             count,
+            comments: added && added.length > 0 ? added : undefined,
             totalCommentsLabel,
           };
           window.postMessage(progress, window.location.origin);

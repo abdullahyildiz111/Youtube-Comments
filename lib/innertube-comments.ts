@@ -1,5 +1,6 @@
 import {
   MAX_FETCHED_COMMENTS,
+  canonicalYouTubeCommentId,
   getYouTubeVideoId,
   type YouTubeComment,
 } from '@/lib/comments';
@@ -29,6 +30,7 @@ interface QueuedToken {
   token: string;
   isReply: boolean;
   clickTrackingParams?: string;
+  parentId?: string;
 }
 
 export interface LoadAllRequest {
@@ -41,6 +43,7 @@ export interface LoadAllProgress {
   type: typeof INNERTUBE_BRIDGE.progress;
   requestId: string;
   count: number;
+  comments?: YouTubeComment[];
   totalCommentsLabel?: string | null;
 }
 
@@ -174,7 +177,8 @@ function decodeBase64Bytes(value: string): number[] {
 function generateCommentContinuation(videoId: string): string | null {
   if (!videoId) return null;
 
-  // Same construction yt-dlp uses to open the comments section without scrolling.
+  // yt-dlp-style comments-section token, sorted by Newest first.
+  // Top comments is a filtered ranking and omits a large share of the thread.
   const bytes = [
     ...decodeBase64Bytes('Eg0SCw=='),
     ...encodeUtf8(videoId),
@@ -192,9 +196,9 @@ function pushToken(tokens: QueuedToken[], next: QueuedToken | null): void {
   tokens.push(next);
 }
 
-function continuationFrom(node: unknown): QueuedToken | null {
+function continuationFrom(node: unknown, depth = 0): QueuedToken | null {
   const record = asRecord(node);
-  if (!record) return null;
+  if (!record || depth > 8) return null;
 
   const continuations = Array.isArray(record.continuations)
     ? record.continuations
@@ -228,19 +232,29 @@ function continuationFrom(node: unknown): QueuedToken | null {
   const nested = [
     record.continuationEndpoint,
     record.serviceEndpoint,
+    record.onTap,
+    record.innertubeCommand,
+    record.command,
+    command,
+    asRecord(command)?.innertubeCommand,
+    asRecord(record.continuationItemViewModel)?.continuationCommand,
     asRecord(asRecord(record.button)?.buttonRenderer)?.command,
     asRecord(asRecord(record.button)?.buttonRenderer)?.navigationEndpoint,
+    asRecord(asRecord(record.button)?.buttonRenderer)?.onTap,
+    asRecord(record.buttonRenderer)?.command,
+    asRecord(record.buttonRenderer)?.onTap,
+    asRecord(record.buttonViewModel)?.onTap,
   ];
 
   for (const child of nested) {
-    const found = continuationFrom(child);
+    const found = continuationFrom(child, depth + 1);
     if (found) return found;
   }
 
   const executor = asRecord(record.commandExecutorCommand);
   if (Array.isArray(executor?.commands)) {
     for (const child of executor.commands) {
-      const found = continuationFrom(child);
+      const found = continuationFrom(child, depth + 1);
       if (found) return found;
     }
   }
@@ -253,6 +267,7 @@ function continuationItem(node: unknown): Record<string, unknown> | null {
   if (!record) return null;
   return (
     asRecord(record.continuationItemRenderer) ??
+    asRecord(record.continuationItemViewModel) ??
     continuationItem(asRecord(record.richItemRenderer)?.content)
   );
 }
@@ -272,6 +287,13 @@ function flattenItems(items: unknown[]): Record<string, unknown>[] {
     if (record.itemSectionRenderer) {
       const contents = asRecord(record.itemSectionRenderer)?.contents;
       if (Array.isArray(contents)) contents.forEach(visit);
+      return;
+    }
+
+    if (record.commentRepliesRenderer) {
+      const replies = asRecord(record.commentRepliesRenderer);
+      if (Array.isArray(replies?.contents)) replies.contents.forEach(visit);
+      if (Array.isArray(replies?.subThreads)) replies.subThreads.forEach(visit);
       return;
     }
 
@@ -418,36 +440,52 @@ export function extractCommentsCountLabel(payload: unknown): string | null {
   return null;
 }
 
-function extractSortToken(items: Record<string, unknown>[]): QueuedToken | null {
-  for (const item of items) {
-    const header = asRecord(item.commentsHeaderRenderer);
-    if (!header) continue;
-
-    const menuItems = asRecord(asRecord(header.sortMenu)?.sortFilterSubMenuRenderer)
-      ?.subMenuItems;
-    if (!Array.isArray(menuItems) || menuItems.length === 0) continue;
-
-    const ranked = menuItems.map((entry) => asRecord(entry));
-    const newest = ranked.find((entry) =>
-      /new/i.test(readString(entry?.title, runsToText(entry?.title))),
-    );
-    const chosen =
-      newest ?? ranked[Math.min(1, ranked.length - 1)] ?? ranked[0];
-    return continuationFrom(chosen?.serviceEndpoint ?? chosen);
-  }
-
-  return null;
+function isNewestSortLabel(label: string): boolean {
+  return /new|yeni|neueste|r[eé]cents?|recientes|recenti|recentes|nieuw|нов|najnowsze|nyeste|nyaste|uudet|חדש|الأحدث|最新|최신/i.test(
+    label,
+  );
 }
 
-function extractNextPageToken(items: Record<string, unknown>[]): QueuedToken | null {
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    const renderer = continuationItem(items[index]);
+function sortTokenFromMenuItems(menuItems: unknown): QueuedToken | null {
+  if (!Array.isArray(menuItems) || menuItems.length === 0) return null;
+
+  const ranked = menuItems.map((entry) => asRecord(entry));
+  const newest = ranked.find((entry) =>
+    isNewestSortLabel(readString(entry?.title, runsToText(entry?.title))),
+  );
+  if (!newest) return null;
+
+  return continuationFrom(
+    newest.serviceEndpoint ?? newest.command ?? newest.onTap ?? newest,
+  );
+}
+
+function extractSortToken(node: unknown): QueuedToken | null {
+  const header =
+    findFirstByKey(node, 'commentsHeaderRenderer') ??
+    findFirstByKey(node, 'commentsHeaderViewModel');
+  const menu =
+    findFirstByKey(header ?? node, 'sortFilterSubMenuRenderer') ??
+    findFirstByKey(node, 'sortFilterSubMenuRenderer');
+  return sortTokenFromMenuItems(menu?.subMenuItems);
+}
+
+function extractPageTokens(
+  items: Record<string, unknown>[],
+  isReply: boolean,
+): QueuedToken[] {
+  const tokens: QueuedToken[] = [];
+
+  for (const item of items) {
+    if (!isReply && isCommentItem(item)) continue;
+    if (!isReply && continuationLooksLikeReplies(item)) continue;
+    const renderer = continuationItem(item);
     if (!renderer) continue;
     const token = continuationFrom(renderer);
-    if (token) return { ...token, isReply: false };
+    if (token) pushToken(tokens, { ...token, isReply });
   }
 
-  return null;
+  return tokens;
 }
 
 function collectReplyTokensFromNode(
@@ -455,7 +493,7 @@ function collectReplyTokensFromNode(
   tokens: QueuedToken[],
   depth = 0,
 ): void {
-  if (depth > 10 || !node || typeof node !== 'object') return;
+  if (depth > 18 || !node || typeof node !== 'object') return;
 
   if (Array.isArray(node)) {
     for (const item of node) collectReplyTokensFromNode(item, tokens, depth + 1);
@@ -463,6 +501,10 @@ function collectReplyTokensFromNode(
   }
 
   const record = node as Record<string, unknown>;
+  if (Array.isArray(record.subThreads)) {
+    collectReplyTokensFromNode(record.subThreads, tokens, depth + 1);
+  }
+
   const renderer = continuationItem(record);
   if (renderer) {
     const token = continuationFrom(renderer);
@@ -471,20 +513,16 @@ function collectReplyTokensFromNode(
 
   const viewReplies = asRecord(asRecord(record.viewReplies)?.buttonRenderer);
   if (viewReplies) {
-    const token = continuationFrom(viewReplies.command ?? viewReplies);
+    const token = continuationFrom(
+      viewReplies.command ?? viewReplies.onTap ?? viewReplies,
+    );
     if (token) pushToken(tokens, { ...token, isReply: true });
   }
 
-  for (const key of [
-    'replies',
-    'commentRepliesRenderer',
-    'contents',
-    'subThreads',
-    'continuations',
-    'commentThreadRenderer',
-    'commentViewModel',
-  ]) {
-    if (record[key]) collectReplyTokensFromNode(record[key], tokens, depth + 1);
+  for (const value of Object.values(record)) {
+    if (value && typeof value === 'object') {
+      collectReplyTokensFromNode(value, tokens, depth + 1);
+    }
   }
 }
 
@@ -492,9 +530,31 @@ function collectReplyTokens(
   items: Record<string, unknown>[],
   tokens: QueuedToken[],
 ): void {
+  let lastRootId = '';
+
   for (const item of items) {
+    if (item.commentsHeaderRenderer || item.commentsHeaderViewModel) continue;
+
+    const itemId = commentIdFromItem(item);
+    if (itemId && !itemId.includes('.')) lastRootId = itemId;
+
+    if (
+      continuationItem(item) &&
+      !isCommentItem(item) &&
+      !continuationLooksLikeReplies(item)
+    ) {
+      continue;
+    }
+
+    const before = tokens.length;
     const thread = asRecord(item.commentThreadRenderer) ?? item;
     collectReplyTokensFromNode(thread, tokens);
+    for (let index = before; index < tokens.length; index += 1) {
+      const token = tokens[index];
+      if (token && !token.parentId && lastRootId) {
+        token.parentId = lastRootId;
+      }
+    }
   }
 }
 
@@ -534,19 +594,82 @@ function findCommentSections(node: unknown, sections: unknown[]): void {
   }
 }
 
+function canonicalCommentId(...values: unknown[]): string {
+  for (const value of values) {
+    const id = canonicalYouTubeCommentId(readString(value));
+    if (id) return id;
+  }
+  return '';
+}
+
+function formatCountLabel(value: unknown, unit: 'like' | 'reply'): string | null {
+  const text = readString(
+    value,
+    asRecord(value)?.simpleText,
+    asRecord(asRecord(asRecord(value)?.accessibility)?.accessibilityData)?.label,
+  );
+  if (!text) return null;
+
+  const unitPattern = unit === 'like' ? 'likes?' : 'replies|reply';
+  const fromSentence = text.match(
+    new RegExp(`([\\d.,]+\\s*[KMB]?)\\s+(?:${unitPattern})`, 'i'),
+  )?.[1];
+  if (fromSentence) return fromSentence.replace(/\s+/g, '');
+
+  const compact = text.match(/^([\d.,]+\s*[KMB]?)$/i)?.[1];
+  if (compact) return compact.replace(/\s+/g, '');
+
+  return null;
+}
+
+function toolbarLikeCount(toolbar: Record<string, unknown> | null): string | null {
+  if (!toolbar) return null;
+
+  const fromA11y = formatCountLabel(toolbar.likeCountA11y, 'like');
+  if (fromA11y) return fromA11y;
+
+  const notLiked = readString(toolbar.likeCountNotliked);
+  if (notLiked && /\d/.test(notLiked)) return notLiked;
+  if (typeof toolbar.likeCountNotliked === 'string') return '0';
+
+  return formatCountLabel(toolbar.likeButtonA11y, 'like') ?? '0';
+}
+
+function toolbarReplyCount(toolbar: Record<string, unknown> | null): string | null {
+  if (!toolbar) return null;
+
+  const fromA11y = formatCountLabel(toolbar.replyCountA11y, 'reply');
+  if (fromA11y) return fromA11y;
+
+  const raw = readString(toolbar.replyCount);
+  if (raw && /\d/.test(raw)) return raw.replace(/[^\d.,KMB]/gi, '') || raw;
+  return '0';
+}
+
 function commentFromEntity(
   payload: Record<string, unknown>,
   isReply: boolean,
+  inheritedParentId?: string,
 ): YouTubeComment | null {
   const properties = asRecord(payload.properties);
   const author = asRecord(payload.author);
   const toolbar = asRecord(payload.toolbar);
-  const text = runsToText(properties?.content);
-  const id = readString(properties?.commentId, payload.key);
+  const content = properties?.content;
+  const text =
+    runsToText(content) ||
+    readString(asRecord(content)?.content, asRecord(asRecord(content)?.content)?.content);
+  const id = canonicalCommentId(properties?.commentId, payload.commentId, payload.key, payload.entityKey);
   if (!text || !id) return null;
 
   const channelId = readString(author?.channelId, author?.canonicalChannelId);
   const replyLevel = Number(properties?.replyLevel ?? 0);
+  const dottedParent = id.includes('.') ? id.slice(0, id.indexOf('.')) : '';
+  const parentId =
+    readString(properties?.parentCommentId, payload.parentCommentId) ||
+    dottedParent ||
+    (inheritedParentId && inheritedParentId !== id ? inheritedParentId : '');
+  const commentIsReply =
+    isReply || replyLevel > 0 || Boolean(parentId) || id.includes('.');
 
   return {
     id,
@@ -556,13 +679,10 @@ function commentFromEntity(
     text,
     publishedAt: readString(properties?.publishedTime),
     permalink: `https://www.youtube.com/watch?v=${getWatchId()}&lc=${id}`,
-    likeCount:
-      readString(
-        toolbar?.likeCountNotliked,
-        toolbar?.likeCountLiked,
-        toolbar?.likeCountA11y,
-      ) || null,
-    isReply: isReply || replyLevel > 0,
+    likeCount: toolbarLikeCount(toolbar),
+    replyCount: commentIsReply ? null : toolbarReplyCount(toolbar),
+    parentId: parentId || null,
+    isReply: commentIsReply,
     isPinned: Boolean(properties?.pinned),
     isCreatorHearted: Boolean(
       asRecord(toolbar?.creatorHeart)?.isHearted || toolbar?.heartActive,
@@ -575,7 +695,7 @@ function commentFromRenderer(
   isReply: boolean,
 ): YouTubeComment | null {
   const text = runsToText(renderer.contentText) || runsToText(renderer.expansionText);
-  const id = readString(renderer.commentId);
+  const id = canonicalCommentId(renderer.commentId);
   if (!text || !id) return null;
 
   const authorEndpoint = asRecord(
@@ -599,8 +719,11 @@ function commentFromRenderer(
     publishedAt: runsToText(renderer.publishedTimeText),
     permalink: `https://www.youtube.com/watch?v=${getWatchId()}&lc=${id}`,
     likeCount:
-      readString(renderer.voteCount, asRecord(renderer.voteCount)?.simpleText) ||
-      null,
+      formatCountLabel(renderer.voteCount, 'like') ??
+      formatCountLabel(asRecord(renderer.voteCount)?.simpleText, 'like') ??
+      '0',
+    replyCount: isReply ? null : formatCountLabel(renderer.replyCount, 'reply'),
+    parentId: readString(renderer.parentCommentId) || null,
     isReply,
     isPinned: Boolean(renderer.pinnedCommentBadge),
     isCreatorHearted: Boolean(
@@ -609,7 +732,11 @@ function commentFromRenderer(
   };
 }
 
-function parseEntities(data: unknown): Map<string, YouTubeComment> {
+function parseEntities(
+  data: unknown,
+  isReply = false,
+  parentId?: string,
+): Map<string, YouTubeComment> {
   const comments = new Map<string, YouTubeComment>();
   const mutations =
     asRecord(asRecord(asRecord(data)?.frameworkUpdates)?.entityBatchUpdate)
@@ -618,11 +745,18 @@ function parseEntities(data: unknown): Map<string, YouTubeComment> {
   if (!Array.isArray(mutations)) return comments;
 
   for (const mutation of mutations) {
-    const payload = asRecord(
-      asRecord(asRecord(mutation)?.payload)?.commentEntityPayload,
-    );
+    const record = asRecord(mutation);
+    const payload = asRecord(asRecord(record?.payload)?.commentEntityPayload);
     if (!payload) continue;
-    const comment = commentFromEntity(payload, false);
+    const comment = commentFromEntity(
+      {
+        ...payload,
+        key: payload.key ?? record?.entityKey,
+        entityKey: record?.entityKey,
+      },
+      isReply,
+      parentId,
+    );
     if (comment) comments.set(comment.id, comment);
   }
 
@@ -663,21 +797,67 @@ function isCommentItem(item: Record<string, unknown>): boolean {
   );
 }
 
+function commentIdFromItem(item: Record<string, unknown>): string {
+  const thread = asRecord(item.commentThreadRenderer);
+  const nested = asRecord(thread?.comment);
+  const renderer = asRecord(nested?.commentRenderer) ?? nested ?? asRecord(item.commentRenderer);
+  const viewModel = asRecord(item.commentViewModel);
+  return canonicalCommentId(
+    renderer?.commentId,
+    asRecord(renderer?.properties)?.commentId,
+    viewModel?.commentId,
+    asRecord(viewModel?.properties)?.commentId,
+  );
+}
+
+function continuationLooksLikeReplies(node: unknown, depth = 0): boolean {
+  const record = asRecord(node);
+  if (!record || depth > 6) return false;
+  if (record.commentRepliesRenderer) return true;
+
+  const targetId = readString(record.targetId);
+  if (/repl/i.test(targetId)) return true;
+
+  const label = readString(
+    accessibilityLabel(record),
+    runsToText(record.text),
+    asRecord(record.text)?.simpleText,
+    runsToText(record.title),
+    record.title,
+  );
+  if (/\b(?:view\s+)?\d[\d.,KMB]*\s*repl(?:y|ies)\b|\bview replies\b/i.test(label)) {
+    return true;
+  }
+
+  const renderer = continuationItem(record);
+  if (renderer && renderer !== record && continuationLooksLikeReplies(renderer, depth + 1)) {
+    return true;
+  }
+
+  for (const key of ['button', 'buttonRenderer', 'buttonViewModel', 'viewReplies', 'replies']) {
+    if (record[key] && continuationLooksLikeReplies(record[key], depth + 1)) return true;
+  }
+
+  return false;
+}
+
 function parseNextResponse(
   data: unknown,
   isReply: boolean,
+  parentId?: string,
 ): {
   comments: YouTubeComment[];
   pageTokens: QueuedToken[];
   replyTokens: QueuedToken[];
+  sortToken: QueuedToken | null;
   totalCommentsLabel: string | null;
 } {
-  const comments = new Map<string, YouTubeComment>(parseEntities(data));
+  const comments = new Map<string, YouTubeComment>(
+    parseEntities(data, isReply, parentId),
+  );
   const pageTokens: QueuedToken[] = [];
   const replyTokens: QueuedToken[] = [];
-  const bodyItems: Record<string, unknown>[] = [];
-  let sortToken: QueuedToken | null = null;
-  let sawCommentItems = false;
+  let sortToken = extractSortToken(data);
   let totalCommentsLabel = extractCommentsCountLabel(data);
 
   for (const list of continuationLists(data)) {
@@ -686,30 +866,28 @@ function parseNextResponse(
     const headerToken = extractSortToken(items);
 
     if (headerToken) sortToken = headerToken;
-    if (items.some(isCommentItem)) {
-      sawCommentItems = true;
-      bodyItems.push(...items);
-    } else if (bodyItems.length === 0 && items.some((item) => continuationItem(item))) {
-      bodyItems.push(...items);
-    }
-
     for (const comment of rendered) comments.set(comment.id, comment);
     collectReplyTokens(items, replyTokens);
+    for (const token of extractPageTokens(items, isReply)) {
+      pushToken(pageTokens, token);
+    }
   }
 
-  if (sortToken) {
-    pushToken(pageTokens, sortToken);
-  }
-  pushToken(pageTokens, extractNextPageToken(bodyItems));
-
-  if (isReply) {
-    for (const comment of comments.values()) comment.isReply = true;
+  if (parentId) {
+    for (const [id, comment] of comments) {
+      if (id === parentId || comment.parentId) continue;
+      comments.set(id, { ...comment, parentId, isReply: true });
+    }
+    for (const token of replyTokens) {
+      if (!token.parentId) token.parentId = parentId;
+    }
   }
 
   return {
     comments: [...comments.values()],
     pageTokens,
     replyTokens,
+    sortToken,
     totalCommentsLabel,
   };
 }
@@ -797,7 +975,9 @@ function seedFromPayload(
       collected.set(comment.id, comment);
     }
     pushToken(pageQueue, extractSortToken(items));
-    pushToken(pageQueue, extractNextPageToken(items));
+    for (const token of extractPageTokens(items, false)) {
+      pushToken(pageQueue, token);
+    }
     collectReplyTokens(items, replyQueue);
     pushToken(pageQueue, continuationFrom(section));
   }
@@ -844,7 +1024,11 @@ export async function fetchVideoCommentCount(
 }
 
 export async function fetchAllVideoComments(
-  onProgress: (count: number, totalCommentsLabel?: string | null) => void,
+  onProgress: (
+    count: number,
+    totalCommentsLabel?: string | null,
+    added?: YouTubeComment[],
+  ) => void,
   maxComments = MAX_FETCHED_COMMENTS,
   expectedVideoId?: string,
   isCancelled?: () => boolean,
@@ -886,6 +1070,7 @@ export async function fetchAllVideoComments(
 
   let pages = 0;
   let rateLimited = false;
+  let followedSortToken = false;
 
   const fetchToken = async (next: QueuedToken): Promise<void> => {
     if (isCancelled?.()) return;
@@ -904,19 +1089,30 @@ export async function fetchAllVideoComments(
       if (isCancelled?.() || getYouTubeVideoId(window.location.href) !== videoId) {
         return;
       }
-      const parsed = parseNextResponse(data, next.isReply);
+      const parsed = parseNextResponse(data, next.isReply, next.parentId);
       if (!totalCommentsLabel && parsed.totalCommentsLabel) {
         totalCommentsLabel = parsed.totalCommentsLabel;
       }
 
+      const added: YouTubeComment[] = [];
       for (const comment of parsed.comments) {
         if (collected.size >= maxComments) break;
+        if (collected.has(comment.id)) {
+          collected.set(comment.id, comment);
+          continue;
+        }
         collected.set(comment.id, comment);
+        added.push(comment);
+      }
+
+      if (!followedSortToken && parsed.sortToken) {
+        followedSortToken = true;
+        pageQueue.push(parsed.sortToken);
       }
 
       for (const token of parsed.pageTokens) pageQueue.push(token);
       for (const token of parsed.replyTokens) replyQueue.push(token);
-      onProgress(collected.size, totalCommentsLabel);
+      onProgress(collected.size, totalCommentsLabel, added);
     } catch (error) {
       const message = error instanceof Error ? error.message : '';
       if (message.includes('rate-limited')) {

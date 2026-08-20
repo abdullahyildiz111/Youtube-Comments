@@ -1,16 +1,23 @@
 import {
   COMMENT_MESSAGES,
+  MAX_FETCHED_COMMENTS,
   MAX_SNAPSHOT_COMMENTS,
   type AutoSummarizePhase,
+  type ChatAboutCommentsResponse,
   type CollectorRequest,
   type CollectorStatus,
   type CommentsSnapshot,
+  type CommentsPageResponse,
   type CommentsUpdatedMessage,
   type LoadAllCommentsResponse,
   type ScrollToCommentsResponse,
   type SummarizeLoadedResponse,
   type YouTubeComment,
+  canonicalYouTubeCommentId,
+  flattenCommentThreads,
   getYouTubeVideoId,
+  groupCommentsForDisplay,
+  orderCommentsForDisplay,
 } from '@/lib/comments';
 import {
   INNERTUBE_BRIDGE,
@@ -21,6 +28,7 @@ import {
 import {
   getCloudSummaryErrorMessage,
   summarizeCommentsInCloud,
+  askCommentsInCloud,
 } from '@/lib/cloud-summarizer';
 import { AUTO_SUMMARIZE_KEY, getAutoSummarizeEnabled } from '@/lib/settings';
 import { readSummaryCache, saveSummary } from '@/lib/summary-cache';
@@ -28,11 +36,11 @@ import { readSummaryCache, saveSummary } from '@/lib/summary-cache';
 const COMMENT_RENDERER_SELECTOR = [
   'ytd-comment-thread-renderer ytd-comment-view-model',
   'ytd-comment-thread-renderer ytd-comment-renderer',
-  'ytd-comments ytd-comment-view-model',
-  'ytd-comments ytd-comment-renderer',
+  'ytd-comments#comments ytd-comment-view-model',
+  'ytd-comments#comments ytd-comment-renderer',
 ].join(',');
 
-const COMMENTS_ROOT_SELECTOR = 'ytd-comments#comments, ytd-comments';
+const COMMENTS_ROOT_SELECTOR = 'ytd-comments#comments';
 
 function normalizeText(value: string | null | undefined): string {
   return value?.replace(/\s+/g, ' ').trim() ?? '';
@@ -57,6 +65,37 @@ function resolveUrl(value: string | null): string | null {
   }
 }
 
+function extractLabeledCount(
+  renderer: Element,
+  unit: 'like' | 'reply',
+): string | null {
+  const pattern =
+    unit === 'like'
+      ? /([\d.,]+(?:\s*[KMB])?)\s+likes?/i
+      : /([\d.,]+(?:\s*[KMB])?)\s+repl(?:y|ies)/i;
+
+  for (const element of renderer.querySelectorAll('[aria-label]')) {
+    const match = element.getAttribute('aria-label')?.match(pattern);
+    if (match?.[1]) return match[1].replace(/\s+/g, '');
+  }
+
+  const thread = renderer.closest('ytd-comment-thread-renderer');
+  if (unit === 'reply' && thread && thread !== renderer) {
+    for (const element of thread.querySelectorAll('[aria-label], #more-replies, #more-replies-button')) {
+      const match = `${element.getAttribute('aria-label') ?? ''} ${element.textContent ?? ''}`.match(
+        pattern,
+      );
+      if (match?.[1]) return match[1].replace(/\s+/g, '');
+    }
+  }
+
+  return null;
+}
+
+function canonicalDomCommentId(value: string | null): string | null {
+  return canonicalYouTubeCommentId(value) || null;
+}
+
 function areCommentsEqual(
   first: YouTubeComment,
   second: YouTubeComment,
@@ -70,6 +109,8 @@ function areCommentsEqual(
     first.publishedAt === second.publishedAt &&
     first.permalink === second.permalink &&
     first.likeCount === second.likeCount &&
+    first.replyCount === second.replyCount &&
+    first.parentId === second.parentId &&
     first.isReply === second.isReply &&
     first.isPinned === second.isPinned &&
     first.isCreatorHearted === second.isCreatorHearted
@@ -154,6 +195,10 @@ export default defineContentScript({
       const explicitId =
         renderer.getAttribute('comment-id') ??
         renderer.getAttribute('data-comment-id');
+      const id =
+        canonicalDomCommentId(permalinkId) ??
+        canonicalDomCommentId(explicitId) ??
+        getFallbackId(renderer);
       const authorElement =
         renderer.querySelector<HTMLAnchorElement>('#author-text[href]');
       const avatarElement = renderer.querySelector<HTMLImageElement>(
@@ -165,7 +210,7 @@ export default defineContentScript({
         avatarElement?.getAttribute('data-thumb');
 
       return {
-        id: permalinkId ?? explicitId ?? getFallbackId(renderer),
+        id,
         author: author || 'Unknown author',
         authorUrl: resolveUrl(authorElement?.getAttribute('href') ?? null),
         avatarUrl: resolveUrl(avatarUrl ?? null),
@@ -173,7 +218,10 @@ export default defineContentScript({
         publishedAt,
         permalink,
         likeCount:
-          readText(renderer, ['#vote-count-middle', '#like-count']) || null,
+          readText(renderer, ['#vote-count-middle', '#like-count']) ||
+          extractLabeledCount(renderer, 'like'),
+        replyCount: extractLabeledCount(renderer, 'reply'),
+        parentId: null,
         isReply: Boolean(
           renderer.closest('ytd-comment-replies-renderer, #replies'),
         ),
@@ -188,22 +236,31 @@ export default defineContentScript({
       };
     };
 
-    const getSnapshot = (): CommentsSnapshot => ({
-      videoId: activeVideoId,
-      videoTitle,
-      channelName,
-      pageUrl: window.location.href,
-      totalCommentsLabel,
-      status,
-      comments: Array.from(comments.values()).slice(0, MAX_SNAPSHOT_COMMENTS),
-      capturedCount: comments.size,
-      capturedAt,
-      fetchedAll,
-      truncated,
-      loadAllCount,
-      autoPhase,
-      autoError,
-    });
+    const listedComments = () =>
+      orderCommentsForDisplay(Array.from(comments.values()));
+    const listedThreads = () =>
+      groupCommentsForDisplay(Array.from(comments.values()));
+
+    const getSnapshot = (): CommentsSnapshot => {
+      const threads = listedThreads();
+      return {
+        videoId: activeVideoId,
+        videoTitle,
+        channelName,
+        pageUrl: window.location.href,
+        totalCommentsLabel,
+        status,
+        comments: flattenCommentThreads(threads.slice(0, MAX_SNAPSHOT_COMMENTS)),
+        capturedCount: comments.size,
+        threadCount: threads.length,
+        capturedAt,
+        fetchedAll,
+        truncated,
+        loadAllCount,
+        autoPhase,
+        autoError,
+      };
+    };
 
     const publishUpdate = () => {
       const signature = [
@@ -375,18 +432,29 @@ export default defineContentScript({
         applyListedCommentCount(nextTotalCommentsLabel);
       }
 
+      const innertubeOwnsComments = fetchedAll || isLoadingAll();
       let commentsChanged = false;
-      const renderers =
-        commentsRoot.querySelectorAll<Element>(COMMENT_RENDERER_SELECTOR);
 
-      for (const renderer of renderers) {
-        const comment = extractComment(renderer);
-        if (!comment) continue;
+      if (!innertubeOwnsComments) {
+        const renderers =
+          commentsRoot.querySelectorAll<Element>(COMMENT_RENDERER_SELECTOR);
 
-        const existingComment = comments.get(comment.id);
-        if (!existingComment || !areCommentsEqual(existingComment, comment)) {
-          comments.set(comment.id, comment);
-          commentsChanged = true;
+        for (const renderer of renderers) {
+          const comment = extractComment(renderer);
+          if (!comment) continue;
+          if (comment.id.includes('-dom-')) {
+            const duplicate = Array.from(comments.values()).some(
+              (existing) =>
+                existing.author === comment.author && existing.text === comment.text,
+            );
+            if (duplicate || fetchedAll) continue;
+          }
+
+          const existingComment = comments.get(comment.id);
+          if (!existingComment || !areCommentsEqual(existingComment, comment)) {
+            comments.set(comment.id, comment);
+            commentsChanged = true;
+          }
         }
       }
 
@@ -550,6 +618,12 @@ export default defineContentScript({
               status = 'loading-all';
               loadAllCount = data.count;
               applyListedCommentCount(data.totalCommentsLabel);
+              if (data.comments?.length) {
+                for (const comment of data.comments) {
+                  comments.set(comment.id, comment);
+                }
+                capturedAt = new Date().toISOString();
+              }
               publishUpdate();
               return;
             }
@@ -569,6 +643,7 @@ export default defineContentScript({
               return;
             }
 
+            comments.clear();
             for (const comment of data.comments) {
               comments.set(comment.id, comment);
             }
@@ -616,8 +691,10 @@ export default defineContentScript({
 
           window.addEventListener('message', onPageMessage);
           status = 'loading-all';
-          loadAllCount = comments.size;
+          comments.clear();
+          loadAllCount = 0;
           fetchedAll = false;
+          capturedAt = null;
           publishUpdate();
           window.postMessage(
             { type: INNERTUBE_BRIDGE.request, requestId, videoId },
@@ -663,7 +740,7 @@ export default defineContentScript({
 
       try {
         const result = await summarizeCommentsInCloud(
-          Array.from(comments.values()),
+          listedComments(),
           activeVideoId,
           videoTitle,
         );
@@ -677,6 +754,34 @@ export default defineContentScript({
         await saveSummary(summary);
         publishSummary(summary);
         return { ok: true, summary };
+      } catch (error: unknown) {
+        return {
+          ok: false,
+          error: getCloudSummaryErrorMessage(error),
+        };
+      }
+    };
+
+    const chatAboutLoadedComments = async (
+      question: string,
+      history: Array<{ role: 'user' | 'assistant'; text: string }>,
+    ): Promise<ChatAboutCommentsResponse> => {
+      if (!activeVideoId || comments.size === 0) {
+        return {
+          ok: false,
+          error: 'Load comments first, then ask a question.',
+        };
+      }
+
+      try {
+        const result = await askCommentsInCloud(
+          listedComments(),
+          activeVideoId,
+          videoTitle,
+          question,
+          history,
+        );
+        return { ok: true, answer: result.text };
       } catch (error: unknown) {
         return {
           ok: false,
@@ -724,7 +829,7 @@ export default defineContentScript({
         return;
       }
 
-      if (cached) {
+      if (cached && cached.commentCount === comments.size) {
         setAutoPhase('idle');
         return;
       }
@@ -778,6 +883,22 @@ export default defineContentScript({
         return Promise.resolve(getSnapshot());
       }
 
+      if (request.type === COMMENT_MESSAGES.getCommentsPage) {
+        const threads = listedThreads();
+        const offset = Math.max(0, Math.floor(request.offset) || 0);
+        const limit = Math.min(
+          MAX_FETCHED_COMMENTS,
+          Math.max(1, Math.floor(request.limit ?? MAX_SNAPSHOT_COMMENTS) || MAX_SNAPSHOT_COMMENTS),
+        );
+        const response: CommentsPageResponse = {
+          videoId: activeVideoId,
+          offset,
+          comments: flattenCommentThreads(threads.slice(offset, offset + limit)),
+          total: threads.length,
+        };
+        return Promise.resolve(response);
+      }
+
       if (request.type === COMMENT_MESSAGES.scrollToComments) {
         const commentsSection = document.querySelector<HTMLElement>(
           `${COMMENTS_ROOT_SELECTOR}, ytd-watch-flexy #comments`,
@@ -811,6 +932,10 @@ export default defineContentScript({
 
       if (request.type === COMMENT_MESSAGES.summarizeLoaded) {
         return summarizeLoadedComments();
+      }
+
+      if (request.type === COMMENT_MESSAGES.chatAboutComments) {
+        return chatAboutLoadedComments(request.question, request.history);
       }
 
       return undefined;

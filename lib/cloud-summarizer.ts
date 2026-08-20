@@ -1,9 +1,10 @@
 import type { YouTubeComment } from '@/lib/comments';
 
-const LOCAL_API_URL = 'http://localhost:3000/summarize';
+const LOCAL_API_ORIGIN = 'http://localhost:3000';
 const REQUEST_TIMEOUT_MS = 180_000;
 
 export const SUMMARIZE_MESSAGE = 'comment-catcher:summarize' as const;
+export const CHAT_MESSAGE = 'comment-catcher:chat' as const;
 
 interface SummaryApiResponse {
   summary?: string;
@@ -23,6 +24,26 @@ export interface SummarizeRequest {
   videoId: string;
   videoTitle: string;
   comments: Array<{ text: string; isReply: boolean }>;
+}
+
+export interface ChatTurn {
+  role: 'user' | 'assistant';
+  text: string;
+}
+
+export interface ChatRequest {
+  type: typeof CHAT_MESSAGE;
+  videoId: string;
+  videoTitle: string;
+  question: string;
+  history: ChatTurn[];
+  comments: Array<{ text: string; isReply: boolean }>;
+}
+
+export interface CloudChatAnswer {
+  text: string;
+  commentCount: number;
+  model: string;
 }
 
 type SummarizeResponse =
@@ -51,19 +72,38 @@ export class CloudSummaryRequestError extends Error {
   }
 }
 
-function getSummaryApiUrl(): string {
+function getBackendUrl(path: '/summarize' | '/chat'): string {
   const configuredUrl = import.meta.env.WXT_SUMMARY_API_URL?.trim();
-  const rawUrl = configuredUrl || (import.meta.env.DEV ? LOCAL_API_URL : '');
+  const rawUrl = configuredUrl || (import.meta.env.DEV ? LOCAL_API_ORIGIN : '');
 
   if (!rawUrl) throw new SummaryBackendNotConfiguredError();
 
   try {
     const url = new URL(rawUrl);
-    if (url.pathname === '/') url.pathname = '/summarize';
+    if (
+      url.pathname === '/' ||
+      url.pathname === '/summarize' ||
+      url.pathname === '/chat'
+    ) {
+      url.pathname = path;
+    } else {
+      url.pathname = path;
+    }
     return url.href;
   } catch {
     throw new SummaryBackendNotConfiguredError();
   }
+}
+
+function apiHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  const apiToken = import.meta.env.WXT_SUMMARY_API_TOKEN?.trim();
+  if (apiToken) {
+    headers.Authorization = `Bearer ${apiToken}`;
+  }
+  return headers;
 }
 
 export async function performSummaryFetch(
@@ -82,17 +122,9 @@ export async function performSummaryFetch(
   );
 
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
-    const apiToken = import.meta.env.WXT_SUMMARY_API_TOKEN?.trim();
-    if (apiToken) {
-      headers.Authorization = `Bearer ${apiToken}`;
-    }
-
-    const response = await fetch(getSummaryApiUrl(), {
+    const response = await fetch(getBackendUrl('/summarize'), {
       method: 'POST',
-      headers,
+      headers: apiHeaders(),
       body: JSON.stringify({
         videoId,
         videoTitle,
@@ -157,6 +189,130 @@ export async function summarizeCommentsInCloud(
   }
 
   if (response.ok) return response.summary;
+
+  if (response.errorName === 'SummaryBackendNotConfiguredError') {
+    throw new SummaryBackendNotConfiguredError();
+  }
+
+  if (typeof response.status === 'number') {
+    throw new CloudSummaryRequestError(response.status, response.errorMessage);
+  }
+
+  if (response.errorName === 'AbortError') {
+    const error = new DOMException(response.errorMessage, 'AbortError');
+    throw error;
+  }
+
+  throw new Error(response.errorMessage);
+}
+
+interface ChatApiResponse {
+  answer?: string;
+  commentCount?: number;
+  model?: string;
+  error?: string;
+}
+
+type ChatResponse =
+  | { ok: true; answer: CloudChatAnswer }
+  | {
+      ok: false;
+      errorMessage: string;
+      errorName?: string;
+      status?: number;
+    };
+
+export async function performChatFetch(
+  comments: Array<{ text: string; isReply: boolean }>,
+  videoId: string,
+  videoTitle: string,
+  question: string,
+  history: ChatTurn[],
+): Promise<CloudChatAnswer> {
+  if (comments.length === 0) {
+    throw new Error('There are no captured comments to ask about.');
+  }
+
+  const controller = new AbortController();
+  const timeout = globalThis.setTimeout(
+    () => controller.abort(),
+    REQUEST_TIMEOUT_MS,
+  );
+
+  try {
+    const response = await fetch(getBackendUrl('/chat'), {
+      method: 'POST',
+      headers: apiHeaders(),
+      body: JSON.stringify({
+        videoId,
+        videoTitle,
+        question,
+        history,
+        comments,
+      }),
+      signal: controller.signal,
+    });
+
+    let payload: ChatApiResponse = {};
+    try {
+      payload = (await response.json()) as ChatApiResponse;
+    } catch {
+      // The status-specific message below is more useful than a JSON error.
+    }
+
+    if (!response.ok) {
+      throw new CloudSummaryRequestError(
+        response.status,
+        payload.error || 'The chat service returned an error.',
+      );
+    }
+
+    if (
+      typeof payload.answer !== 'string' ||
+      !payload.answer.trim() ||
+      typeof payload.commentCount !== 'number'
+    ) {
+      throw new Error('The chat service returned an invalid response.');
+    }
+
+    return {
+      text: payload.answer.trim(),
+      commentCount: payload.commentCount,
+      model: payload.model || 'Gemini Flash-Lite',
+    };
+  } finally {
+    globalThis.clearTimeout(timeout);
+  }
+}
+
+export async function askCommentsInCloud(
+  comments: YouTubeComment[],
+  videoId: string,
+  videoTitle: string,
+  question: string,
+  history: ChatTurn[],
+): Promise<CloudChatAnswer> {
+  const request: ChatRequest = {
+    type: CHAT_MESSAGE,
+    videoId,
+    videoTitle,
+    question,
+    history,
+    comments: comments.map((comment) => ({
+      text: comment.text,
+      isReply: comment.isReply,
+    })),
+  };
+
+  const response = (await browser.runtime.sendMessage(
+    request,
+  )) as ChatResponse | undefined;
+
+  if (!response) {
+    throw new TypeError('The summary backend could not be reached.');
+  }
+
+  if (response.ok) return response.answer;
 
   if (response.errorName === 'SummaryBackendNotConfiguredError') {
     throw new SummaryBackendNotConfiguredError();

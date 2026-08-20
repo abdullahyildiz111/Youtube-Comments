@@ -2,13 +2,15 @@
 
 Comment Catcher can read comments already painted on a YouTube video page and
 can also request the comment thread from YouTube so you do not have to scroll.
-It does not transmit anything until the user selects **Summarize all comments**.
+It does not transmit anything until the user selects **Summarize all comments**
+or asks a question in **Ask the comments**.
 
-## Data sent for a summary
+## Data sent for a summary or chat
 
 - YouTube video ID and title
 - Captured comment text
 - Whether each captured item is a reply
+- For chat, the question and recent conversation turns
 
 The extension sends this data to the summary API you host (Coolify on a Hetzner
 VPS by default). That API forwards the text to the Google Gemini API. Request
@@ -19,9 +21,9 @@ the current Google Gemini API terms before deploying this extension.
 
 ## Local storage
 
-Generated summaries, video IDs, comment counts, and generation timestamps are
-stored in browser-local extension storage for up to 20 recent videos. Removing
-the extension clears this storage.
+Generated summaries, chat transcripts, video IDs, comment counts, and
+generation timestamps are stored in browser-local extension storage for up to
+20 recent videos. Removing the extension clears this storage.
 
 ## Secrets
 
