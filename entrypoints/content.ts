@@ -6,18 +6,24 @@ import {
   type ChatAboutCommentsResponse,
   type CollectorRequest,
   type CollectorStatus,
+  type CommentThread,
   type CommentsSnapshot,
   type CommentsPageResponse,
   type CommentsUpdatedMessage,
   type LoadAllCommentsResponse,
   type ScrollToCommentsResponse,
   type SummarizeLoadedResponse,
+  type CommentSortOrder,
   type YouTubeComment,
+  DEFAULT_COMMENT_SORT_ORDER,
   canonicalYouTubeCommentId,
   flattenCommentThreads,
   getYouTubeVideoId,
   groupCommentsForDisplay,
+  isFeaturedByYouTube,
   orderCommentsForDisplay,
+  threadParentId,
+  toCommentSortOrder,
 } from '@/lib/comments';
 import {
   INNERTUBE_BRIDGE,
@@ -30,7 +36,12 @@ import {
   summarizeCommentsInCloud,
   askCommentsInCloud,
 } from '@/lib/cloud-summarizer';
-import { AUTO_SUMMARIZE_KEY, getAutoSummarizeEnabled } from '@/lib/settings';
+import {
+  AUTO_SUMMARIZE_KEY,
+  HIDE_FILTERED_KEY,
+  getAutoSummarizeEnabled,
+  getHideFilteredComments,
+} from '@/lib/settings';
 import { readSummaryCache, saveSummary } from '@/lib/summary-cache';
 
 const COMMENT_RENDERER_SELECTOR = [
@@ -113,8 +124,27 @@ function areCommentsEqual(
     first.parentId === second.parentId &&
     first.isReply === second.isReply &&
     first.isPinned === second.isPinned &&
-    first.isCreatorHearted === second.isCreatorHearted
+    first.pinnedLabel === second.pinnedLabel &&
+    first.isCreatorHearted === second.isCreatorHearted &&
+    first.isVerified === second.isVerified &&
+    first.isChannelOwner === second.isChannelOwner &&
+    first.topRank === second.topRank &&
+    first.newestRank === second.newestRank &&
+    first.replyRank === second.replyRank
   );
+}
+
+// YouTube's sort menu always lists Top first and Newest second, so the
+// selected index survives translation. It renders lazily, and YouTube opens
+// every video on Top, which is the right assumption until it appears.
+function pageSortOrder(): CommentSortOrder {
+  const options = document.querySelectorAll(
+    `${COMMENTS_ROOT_SELECTOR} #sort-menu a.yt-dropdown-menu`,
+  );
+  const selected = Array.from(options).findIndex(
+    (option) => option.getAttribute('aria-selected') === 'true',
+  );
+  return selected === 1 ? 'newest' : 'top';
 }
 
 export default defineContentScript({
@@ -146,6 +176,13 @@ export default defineContentScript({
     let scanTimeout: number | undefined;
     let fallbackId = 0;
     let lastPublishedSignature = '';
+    // The order the popup is showing. YouTube resets to "Top" on every video,
+    // so this does too.
+    let sortOrder: CommentSortOrder = DEFAULT_COMMENT_SORT_ORDER;
+    let hideFilteredComments = false;
+    // True once YouTube's own ranking is in the store. Page order is only a
+    // stand-in until then, and mixing the two scales would scramble the list.
+    let hasFetchedRanks = false;
 
     const comments = new Map<string, YouTubeComment>();
     let fallbackIds = new WeakMap<Element, string>();
@@ -161,7 +198,10 @@ export default defineContentScript({
       return id;
     };
 
-    const extractComment = (renderer: Element): YouTubeComment | null => {
+    const extractComment = (
+      renderer: Element,
+      rank: { order: CommentSortOrder; root: number | null; reply: number | null },
+    ): YouTubeComment | null => {
       const text = readText(renderer, [
         '#content-text',
         'yt-attributed-string#content-text',
@@ -199,6 +239,9 @@ export default defineContentScript({
         canonicalDomCommentId(permalinkId) ??
         canonicalDomCommentId(explicitId) ??
         getFallbackId(renderer);
+      const pinnedBadge = renderer.querySelector(
+        'ytd-pinned-comment-badge-renderer, #pinned-comment-badge',
+      );
       const authorElement =
         renderer.querySelector<HTMLAnchorElement>('#author-text[href]');
       const avatarElement = renderer.querySelector<HTMLImageElement>(
@@ -225,21 +268,81 @@ export default defineContentScript({
         isReply: Boolean(
           renderer.closest('ytd-comment-replies-renderer, #replies'),
         ),
-        isPinned: Boolean(
-          renderer.querySelector(
-            'ytd-pinned-comment-badge-renderer, #pinned-comment-badge',
-          ),
-        ),
+        isPinned: Boolean(pinnedBadge),
+        pinnedLabel: normalizeText(pinnedBadge?.textContent) || null,
         isCreatorHearted: Boolean(
           renderer.querySelector('#creator-heart, ytd-creator-heart-renderer'),
         ),
+        isVerified: Boolean(
+          renderer.querySelector(
+            '#author-text ytd-badge-supported-renderer, .badge-style-type-verified, [aria-label="Verified"]',
+          ),
+        ),
+        isChannelOwner:
+          renderer.hasAttribute('author-is-uploader') ||
+          Boolean(renderer.querySelector('#author-comment-badge')),
+        // The page is already showing YouTube's order, so its own layout is
+        // the ranking until the full thread is fetched.
+        topRank: rank.order === 'top' ? rank.root : null,
+        newestRank: rank.order === 'newest' ? rank.root : null,
+        replyRank: rank.reply,
       };
     };
 
+    const allThreads = (order: CommentSortOrder = sortOrder) =>
+      groupCommentsForDisplay(Array.from(comments.values()), order);
+
+    // A comment counts as unfeatured only once the whole thread has been
+    // walked. On a partial or capped load a missing Top listing just means the
+    // Top pass never reached it, so filtering is held back until then.
+    const canFilterByRanking = () => fetchedAll && !truncated;
+
+    const filteredThreadCount = (order: CommentSortOrder = sortOrder) => {
+      if (!canFilterByRanking()) return 0;
+
+      let hidden = 0;
+      for (const thread of allThreads(order)) {
+        if (!isFeaturedByYouTube(thread.parent)) {
+          hidden += 1 + thread.replies.length;
+          continue;
+        }
+        hidden += thread.replies.length - withFeaturedReplies(thread).replies.length;
+      }
+      return hidden;
+    };
+
+    // Replies are only hidden when what is left matches the reply total
+    // YouTube's own Top listing reports. A long thread can outrun the Top
+    // pass, and dropping replies on an unconfirmed count would hide ordinary
+    // comments, so those threads are left whole.
+    const withFeaturedReplies = (thread: CommentThread): CommentThread => {
+      const replies = thread.replies.filter((reply) => isFeaturedByYouTube(reply));
+      if (replies.length === thread.replies.length) return thread;
+
+      const listed = Number(thread.parent.featuredReplyCount);
+      if (!Number.isFinite(listed) || listed !== replies.length) return thread;
+
+      return {
+        parent: { ...thread.parent, replyCount: String(listed) },
+        replies,
+      };
+    };
+
+    const listedThreads = (order: CommentSortOrder = sortOrder) => {
+      const threads = allThreads(order);
+      if (!hideFilteredComments || !canFilterByRanking()) return threads;
+
+      const featured = threads
+        .filter((thread) => isFeaturedByYouTube(thread.parent))
+        .map(withFeaturedReplies);
+
+      return featured.length > 0 ? featured : threads;
+    };
+
     const listedComments = () =>
-      orderCommentsForDisplay(Array.from(comments.values()));
-    const listedThreads = () =>
-      groupCommentsForDisplay(Array.from(comments.values()));
+      hideFilteredComments && canFilterByRanking()
+        ? flattenCommentThreads(listedThreads())
+        : orderCommentsForDisplay(Array.from(comments.values()), sortOrder);
 
     const getSnapshot = (): CommentsSnapshot => {
       const threads = listedThreads();
@@ -259,6 +362,9 @@ export default defineContentScript({
         loadAllCount,
         autoPhase,
         autoError,
+        sortOrder,
+        hideFilteredComments,
+        filteredCount: filteredThreadCount(),
       };
     };
 
@@ -276,6 +382,8 @@ export default defineContentScript({
         loadAllCount,
         autoPhase,
         autoError,
+        sortOrder,
+        hideFilteredComments,
       ].join('|');
 
       if (signature === lastPublishedSignature) return;
@@ -307,6 +415,8 @@ export default defineContentScript({
       autoError = null;
       autoRunId += 1;
       loadGeneration += 1;
+      sortOrder = DEFAULT_COMMENT_SORT_ORDER;
+      hasFetchedRanks = false;
       comments.clear();
       fallbackId = 0;
       fallbackIds = new WeakMap<Element, string>();
@@ -438,10 +548,37 @@ export default defineContentScript({
       if (!innertubeOwnsComments) {
         const renderers =
           commentsRoot.querySelectorAll<Element>(COMMENT_RENDERER_SELECTOR);
+        const order = pageSortOrder();
+        const rankFromPage = !hasFetchedRanks;
+        const replyCursors = new Map<string, number>();
+        let rootCursor = 0;
 
         for (const renderer of renderers) {
-          const comment = extractComment(renderer);
+          const isReply = Boolean(
+            renderer.closest('ytd-comment-replies-renderer, #replies'),
+          );
+          const probe = extractComment(renderer, {
+            order,
+            root: null,
+            reply: null,
+          });
+          if (!probe) continue;
+
+          const parentId = isReply ? threadParentId(probe) : null;
+          let replyRank: number | null = null;
+
+          if (isReply && parentId) {
+            replyRank = replyCursors.get(parentId) ?? 0;
+            replyCursors.set(parentId, replyRank + 1);
+          }
+
+          const comment = extractComment(renderer, {
+            order,
+            root: rankFromPage && !isReply ? rootCursor : null,
+            reply: rankFromPage ? replyRank : null,
+          });
           if (!comment) continue;
+          if (!isReply) rootCursor += 1;
           if (comment.id.includes('-dom-')) {
             const duplicate = Array.from(comments.values()).some(
               (existing) =>
@@ -619,6 +756,7 @@ export default defineContentScript({
               loadAllCount = data.count;
               applyListedCommentCount(data.totalCommentsLabel);
               if (data.comments?.length) {
+                hasFetchedRanks = true;
                 for (const comment of data.comments) {
                   comments.set(comment.id, comment);
                 }
@@ -644,6 +782,7 @@ export default defineContentScript({
             }
 
             comments.clear();
+            hasFetchedRanks = true;
             for (const comment of data.comments) {
               comments.set(comment.id, comment);
             }
@@ -879,11 +1018,19 @@ export default defineContentScript({
       const request = message as CollectorRequest;
 
       if (request.type === COMMENT_MESSAGES.getSnapshot) {
+        if (request.sortOrder) sortOrder = toCommentSortOrder(request.sortOrder);
+        if (typeof request.hideFilteredComments === 'boolean') {
+          hideFilteredComments = request.hideFilteredComments;
+        }
         scan();
         return Promise.resolve(getSnapshot());
       }
 
       if (request.type === COMMENT_MESSAGES.getCommentsPage) {
+        if (request.sortOrder) sortOrder = toCommentSortOrder(request.sortOrder);
+        if (typeof request.hideFilteredComments === 'boolean') {
+          hideFilteredComments = request.hideFilteredComments;
+        }
         const threads = listedThreads();
         const offset = Math.max(0, Math.floor(request.offset) || 0);
         const limit = Math.min(
@@ -895,6 +1042,8 @@ export default defineContentScript({
           offset,
           comments: flattenCommentThreads(threads.slice(offset, offset + limit)),
           total: threads.length,
+          sortOrder,
+          hideFilteredComments,
         };
         return Promise.resolve(response);
       }
@@ -947,7 +1096,14 @@ export default defineContentScript({
       changes: Record<string, { newValue?: unknown }>,
       areaName: string,
     ) => {
-      if (areaName !== 'local' || !(AUTO_SUMMARIZE_KEY in changes)) return;
+      if (areaName !== 'local') return;
+
+      if (HIDE_FILTERED_KEY in changes) {
+        hideFilteredComments = changes[HIDE_FILTERED_KEY]?.newValue === true;
+        publishUpdate();
+      }
+
+      if (!(AUTO_SUMMARIZE_KEY in changes)) return;
       autoEnabled = changes[AUTO_SUMMARIZE_KEY]?.newValue === true;
       scheduleAutoSummarize();
     };
@@ -984,6 +1140,9 @@ export default defineContentScript({
     void getAutoSummarizeEnabled().then((enabled) => {
       autoEnabled = enabled;
       scheduleAutoSummarize();
+    });
+    void getHideFilteredComments().then((enabled) => {
+      hideFilteredComments = enabled;
     });
   },
 });

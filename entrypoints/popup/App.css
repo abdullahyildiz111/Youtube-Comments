@@ -780,6 +780,14 @@ main {
   padding: 0 3px 10px;
 }
 
+.comments-section .section-heading {
+  position: sticky;
+  top: -14px;
+  z-index: 5;
+  padding-top: 10px;
+  background: #f7f7f8;
+}
+
 .section-heading h2 {
   margin: 0;
   color: #28282c;
@@ -909,35 +917,73 @@ main {
   white-space: pre-wrap;
 }
 
-.badges {
+/*
+ * "Pinned by @channel" sits above the author line, the way YouTube shows it.
+ */
+.pinned-row {
   display: flex;
-  flex-wrap: wrap;
+  align-items: center;
   gap: 4px;
-  margin-top: 4px;
+  margin-bottom: 4px;
+  color: #606060;
+  font-size: 11px;
+  font-weight: 650;
 }
 
-.badges:empty {
-  display: none;
+.pinned-row svg {
+  width: 12px;
+  height: 12px;
+  fill: currentColor;
+  flex: none;
 }
 
-.badges span {
-  padding: 2px 5px;
-  color: #8c4b00;
-  background: #fff3df;
-  border-radius: 4px;
-  font-size: 8px;
-  font-weight: 750;
-  text-transform: uppercase;
+.comment-meta .verified {
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  color: #909096;
+}
+
+.comment-meta .verified svg {
+  width: 11px;
+  height: 11px;
+  fill: currentColor;
+}
+
+.comment-meta strong.is-owner {
+  padding: 1px 6px;
+  color: #ffffff;
+  background: #606060;
+  border-radius: 999px;
 }
 
 .comment-stats {
   display: flex;
+  align-items: center;
   gap: 12px;
   margin-top: 8px;
   color: #5c5c64;
   font-size: 11px;
   font-weight: 650;
 }
+
+.comment-stats .stat-likes,
+.comment-stats .stat-heart {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.comment-stats svg {
+  width: 12px;
+  height: 12px;
+  fill: currentColor;
+}
+
+.comment-stats .stat-heart {
+  color: #e0245e;
+}
+
 
 .list-limit {
   margin: 8px 0 0;
@@ -977,4 +1023,121 @@ footer {
   .icon-button:disabled svg {
     animation-duration: 1.8s;
   }
+}
+
+/*
+ * Comment sort control. Metrics, colours and copy are taken from YouTube's
+ * own comments header so the popup reads the same way the page does.
+ */
+.section-title-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.sort-menu {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.sort-trigger {
+  display: flex;
+  align-items: center;
+  height: 24px;
+  padding: 0;
+  color: #0f0f0f;
+  background: transparent;
+  border: 0;
+  border-radius: 3px;
+  font-family: 'Roboto', Arial, sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 22px;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+}
+
+.sort-trigger:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.sort-trigger svg {
+  width: 24px;
+  height: 24px;
+  margin-right: 8px;
+  fill: currentColor;
+}
+
+.sort-options {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 30;
+  width: 148px;
+  padding: 8px 0;
+  background: #ffffff;
+  border-radius: 8px;
+  box-shadow:
+    0 2px 2px 0 rgb(0 0 0 / 14%),
+    0 1px 5px 0 rgb(0 0 0 / 12%),
+    0 3px 1px -2px rgb(0 0 0 / 20%);
+}
+
+.sort-option {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  width: 100%;
+  min-height: 48px;
+  padding: 0 16px;
+  background: transparent;
+  border: 0;
+  font-family: 'Roboto', Arial, sans-serif;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sort-option:hover,
+.sort-option.is-selected {
+  background: rgb(0 0 0 / 20%);
+}
+
+.sort-option-title {
+  color: #0f0f0f;
+  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
+}
+
+.sort-option-subtitle {
+  color: #606060;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 18px;
+}
+
+.filter-switch {
+  font-size: 9px;
+}
+
+.section-subactions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0 3px 8px;
+}
+
+.filter-note {
+  margin-right: auto;
+  color: #9a9aa1;
+  font-size: 10px;
+}
+
+.filter-switch.is-unavailable {
+  opacity: 0.45;
+  cursor: default;
 }

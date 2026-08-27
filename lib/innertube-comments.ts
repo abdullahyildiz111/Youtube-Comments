@@ -2,6 +2,7 @@ import {
   MAX_FETCHED_COMMENTS,
   canonicalYouTubeCommentId,
   getYouTubeVideoId,
+  type CommentSortOrder,
   type YouTubeComment,
 } from '@/lib/comments';
 
@@ -16,7 +17,7 @@ export const INNERTUBE_BRIDGE = {
   ready: 'comment-catcher:bridge-ready',
 } as const;
 
-const MAX_CONTINUATION_PAGES = 1_000;
+const MAX_CONTINUATION_PAGES = 2_000;
 const PAGE_CONCURRENCY = 2;
 const REPLY_CONCURRENCY = 8;
 
@@ -31,6 +32,9 @@ interface QueuedToken {
   isReply: boolean;
   clickTrackingParams?: string;
   parentId?: string;
+  // Set on top-level pages so every comment on the page can be given the
+  // position YouTube gave it in that order.
+  sort?: CommentSortOrder;
 }
 
 export interface LoadAllRequest {
@@ -174,25 +178,39 @@ function decodeBase64Bytes(value: string): number[] {
   return Array.from(atob(value), (char) => char.charCodeAt(0));
 }
 
-function generateCommentContinuation(videoId: string): string | null {
+function generateCommentContinuation(
+  videoId: string,
+  order: CommentSortOrder,
+): string | null {
   if (!videoId) return null;
 
-  // yt-dlp-style comments-section token, sorted by Newest first.
-  // Top comments is a filtered ranking and omits a large share of the thread.
+  // yt-dlp-style comments-section token. Field 6 of the protobuf is the sort
+  // selector YouTube's own header sends: 0 is "Top", 1 is "Newest". Asking
+  // YouTube for each order is what makes the list match the page, because
+  // "Top" is a server-side ranking rather than a like-count sort.
   const bytes = [
     ...decodeBase64Bytes('Eg0SCw=='),
     ...encodeUtf8(videoId),
     ...decodeBase64Bytes('GAYyJyIRIgs='),
     ...encodeUtf8(videoId),
-    ...decodeBase64Bytes('MAF4AjAAQhBjb21tZW50cy1zZWN0aW9u'),
+    0x30,
+    order === 'newest' ? 0x01 : 0x00,
+    ...decodeBase64Bytes('eAIwAEIQY29tbWVudHMtc2VjdGlvbg=='),
   ];
 
   return bytesToBase64(bytes);
 }
 
+// Each sort chain walks its own copy of a continuation. The two listings hand
+// back different tokens for the same thread, and collapsing them would let one
+// chain's pages be credited to the other.
+function tokenChainKey(token: QueuedToken): string {
+  return `${token.sort ?? ''}|${token.token}`;
+}
+
 function pushToken(tokens: QueuedToken[], next: QueuedToken | null): void {
   if (!next?.token || next.token.length < 16) return;
-  if (tokens.some((item) => item.token === next.token)) return;
+  if (tokens.some((item) => tokenChainKey(item) === tokenChainKey(next))) return;
   tokens.push(next);
 }
 
@@ -650,6 +668,7 @@ function commentFromEntity(
   payload: Record<string, unknown>,
   isReply: boolean,
   inheritedParentId?: string,
+  heartedToolbarKeys?: Set<string>,
 ): YouTubeComment | null {
   const properties = asRecord(payload.properties);
   const author = asRecord(payload.author);
@@ -662,6 +681,7 @@ function commentFromEntity(
   if (!text || !id) return null;
 
   const channelId = readString(author?.channelId, author?.canonicalChannelId);
+  const toolbarStateKey = readString(properties?.toolbarStateKey, payload.toolbarStateKey);
   const replyLevel = Number(properties?.replyLevel ?? 0);
   const dottedParent = id.includes('.') ? id.slice(0, id.indexOf('.')) : '';
   const parentId =
@@ -683,10 +703,15 @@ function commentFromEntity(
     replyCount: commentIsReply ? null : toolbarReplyCount(toolbar),
     parentId: parentId || null,
     isReply: commentIsReply,
-    isPinned: Boolean(properties?.pinned),
+    // Pinned never appears on the entity; parseNextResponse merges it in from
+    // the rendered thread.
+    isPinned: false,
+    pinnedLabel: null,
     isCreatorHearted: Boolean(
-      asRecord(toolbar?.creatorHeart)?.isHearted || toolbar?.heartActive,
+      toolbarStateKey && heartedToolbarKeys?.has(toolbarStateKey),
     ),
+    isVerified: Boolean(author?.isVerified || author?.isArtist),
+    isChannelOwner: Boolean(author?.isCreator),
   };
 }
 
@@ -744,6 +769,21 @@ function parseEntities(
 
   if (!Array.isArray(mutations)) return comments;
 
+  // The creator heart lives in its own entity, keyed by the comment's
+  // toolbarStateKey, so it has to be gathered before the comments are built.
+  const heartedToolbarKeys = new Set<string>();
+  for (const mutation of mutations) {
+    const state = asRecord(
+      asRecord(asRecord(mutation)?.payload)?.engagementToolbarStateEntityPayload,
+    );
+    if (!state) continue;
+    if (/HEARTED/i.test(readString(state.heartState)) &&
+        !/UNHEARTED/i.test(readString(state.heartState))) {
+      const key = readString(state.key, asRecord(mutation)?.entityKey);
+      if (key) heartedToolbarKeys.add(key);
+    }
+  }
+
   for (const mutation of mutations) {
     const record = asRecord(mutation);
     const payload = asRecord(asRecord(record?.payload)?.commentEntityPayload);
@@ -756,6 +796,7 @@ function parseEntities(
       },
       isReply,
       parentId,
+      heartedToolbarKeys,
     );
     if (comment) comments.set(comment.id, comment);
   }
@@ -801,7 +842,8 @@ function commentIdFromItem(item: Record<string, unknown>): string {
   const thread = asRecord(item.commentThreadRenderer);
   const nested = asRecord(thread?.comment);
   const renderer = asRecord(nested?.commentRenderer) ?? nested ?? asRecord(item.commentRenderer);
-  const viewModel = asRecord(item.commentViewModel);
+  const outerViewModel = asRecord(item.commentViewModel) ?? asRecord(thread?.commentViewModel);
+  const viewModel = asRecord(outerViewModel?.commentViewModel) ?? outerViewModel;
   return canonicalCommentId(
     renderer?.commentId,
     asRecord(renderer?.properties)?.commentId,
@@ -841,6 +883,47 @@ function continuationLooksLikeReplies(node: unknown, depth = 0): boolean {
   return false;
 }
 
+function threadViewModel(item: Record<string, unknown>): Record<string, unknown> | null {
+  const thread = asRecord(item.commentThreadRenderer);
+  const outer = asRecord(item.commentViewModel) ?? asRecord(thread?.commentViewModel);
+  return asRecord(outer?.commentViewModel) ?? outer;
+}
+
+// "Pinned by @channel" is only ever sent on the rendered thread, never on the
+// comment entity, so it has to be read here and merged onto the comment.
+function pinnedLabelsFromItems(
+  items: Record<string, unknown>[],
+): Map<string, string> {
+  const pinned = new Map<string, string>();
+
+  for (const item of items) {
+    const viewModel = threadViewModel(item);
+    if (!viewModel) continue;
+
+    const label = readString(
+      viewModel.pinnedText,
+      runsToText(viewModel.pinnedText),
+      asRecord(viewModel.pinnedText)?.simpleText,
+    );
+    const id = canonicalCommentId(viewModel.commentId);
+    if (label && id) pinned.set(id, label);
+  }
+
+  return pinned;
+}
+
+function orderedIdsFromItems(items: Record<string, unknown>[]): string[] {
+  const ids: string[] = [];
+
+  for (const item of items) {
+    if (!isCommentItem(item)) continue;
+    const id = commentIdFromItem(item);
+    if (id) ids.push(id);
+  }
+
+  return ids;
+}
+
 function parseNextResponse(
   data: unknown,
   isReply: boolean,
@@ -851,12 +934,17 @@ function parseNextResponse(
   replyTokens: QueuedToken[];
   sortToken: QueuedToken | null;
   totalCommentsLabel: string | null;
+  orderedRootIds: string[];
+  orderedReplyIds: string[];
 } {
   const comments = new Map<string, YouTubeComment>(
     parseEntities(data, isReply, parentId),
   );
   const pageTokens: QueuedToken[] = [];
   const replyTokens: QueuedToken[] = [];
+  const orderedRootIds: string[] = [];
+  const orderedReplyIds: string[] = [];
+  const pinnedLabels = new Map<string, string>();
   let sortToken = extractSortToken(data);
   let totalCommentsLabel = extractCommentsCountLabel(data);
 
@@ -867,10 +955,24 @@ function parseNextResponse(
 
     if (headerToken) sortToken = headerToken;
     for (const comment of rendered) comments.set(comment.id, comment);
+    for (const [id, label] of pinnedLabelsFromItems(items)) {
+      const comment = comments.get(id);
+      if (comment) comments.set(id, { ...comment, isPinned: true, pinnedLabel: label });
+      else pinnedLabels.set(id, label);
+    }
+    for (const id of orderedIdsFromItems(items)) {
+      if (id.includes('.')) orderedReplyIds.push(id);
+      else orderedRootIds.push(id);
+    }
     collectReplyTokens(items, replyTokens);
     for (const token of extractPageTokens(items, isReply)) {
       pushToken(pageTokens, token);
     }
+  }
+
+  for (const [id, label] of pinnedLabels) {
+    const comment = comments.get(id);
+    if (comment) comments.set(id, { ...comment, isPinned: true, pinnedLabel: label });
   }
 
   if (parentId) {
@@ -889,7 +991,49 @@ function parseNextResponse(
     replyTokens,
     sortToken,
     totalCommentsLabel,
+    orderedRootIds,
+    orderedReplyIds,
   };
+}
+
+// YouTube signs its own API calls with a hash of the SAPISID cookie. Without
+// it the endpoint answers as though nobody is signed in, and "Top" comes back
+// in the signed-out ranking instead of the one the page is showing. The hash
+// is built and sent in the page, to the same origin the cookie belongs to,
+// exactly as youtube.com does it.
+let cachedAuthorization: { value: string; expiresAt: number } | null = null;
+let authorizationRejected = false;
+
+async function sapisidAuthorization(): Promise<string | null> {
+  if (authorizationRejected) return null;
+  if (cachedAuthorization && cachedAuthorization.expiresAt > Date.now()) {
+    return cachedAuthorization.value;
+  }
+
+  try {
+    const cookie = document.cookie.match(
+      /(?:^|;\s*)(?:SAPISID|__Secure-3PAPISID|__Secure-1PAPISID)=([^;]+)/,
+    );
+    const sapisid = cookie?.[1];
+    if (!sapisid || !crypto?.subtle) return null;
+
+    const timestamp = Math.floor(Date.now() / 1000);
+    const origin = window.location.origin;
+    const digest = await crypto.subtle.digest(
+      'SHA-1',
+      new TextEncoder().encode(`${timestamp} ${sapisid} ${origin}`),
+    );
+    const hash = Array.from(new Uint8Array(digest))
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('');
+    const value = `SAPISIDHASH ${timestamp}_${hash}`;
+    cachedAuthorization = { value, expiresAt: Date.now() + 300_000 };
+    return value;
+  } catch {
+    // Signing is best effort. Without it the thread still loads, just in the
+    // signed-out ranking.
+    return null;
+  }
 }
 
 async function fetchInnertube(
@@ -925,12 +1069,33 @@ async function fetchInnertube(
   };
   if (visitorId) headers['X-Goog-Visitor-Id'] = visitorId;
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-    credentials: 'same-origin',
-  });
+  const authorization = await sapisidAuthorization();
+  if (authorization) {
+    headers.Authorization = authorization;
+    headers['X-Origin'] = window.location.origin;
+    headers['X-Goog-AuthUser'] = readString(getYtcfgValue('SESSION_INDEX')) || '0';
+  }
+
+  const send = () =>
+    fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+      credentials: 'same-origin',
+    });
+
+  let response = await send();
+
+  // If YouTube will not take the signature, fall back to unsigned requests for
+  // the rest of the session rather than failing the load.
+  if (response.status === 401 && authorization) {
+    authorizationRejected = true;
+    cachedAuthorization = null;
+    delete headers.Authorization;
+    delete headers['X-Origin'];
+    delete headers['X-Goog-AuthUser'];
+    response = await send();
+  }
 
   if (!response.ok) {
     if (response.status === 429 || response.status === 403) {
@@ -1012,7 +1177,7 @@ export async function fetchVideoCommentCount(
     // Fall through to the comments continuation, which has the header count.
   }
 
-  const generated = generateCommentContinuation(videoId);
+  const generated = generateCommentContinuation(videoId, 'newest');
   if (!generated) return null;
 
   const data = await fetchInnertube(context, { continuation: generated });
@@ -1055,10 +1220,65 @@ export async function fetchAllVideoComments(
   const replyQueue: QueuedToken[] = [];
   let totalCommentsLabel: string | null = null;
 
-  const generated = generateCommentContinuation(videoId);
-  if (generated) {
-    pushToken(pageQueue, { token: generated, isReply: false });
+  // Positions YouTube gave each comment, per order. Walking both listings is
+  // the only way to reproduce "Top", and it also tells us which comments
+  // YouTube's ranking leaves out.
+  const topRanks = new Map<string, number>();
+  const newestRanks = new Map<string, number>();
+  const replyRanks = new Map<string, number>();
+  // Every comment YouTube served through the Top listing, replies included.
+  // Reply continuations carry the sort of the page they were found on, so the
+  // Top chain returns the moderated set and the Newest chain returns the same
+  // thread plus whatever YouTube keeps out of it.
+  const featuredIds = new Set<string>();
+  // Reply totals as the Top listing reports them, used to confirm we have the
+  // whole moderated thread before hiding anything from it.
+  const featuredReplyCounts = new Map<string, string>();
+  const replyCursors = new Map<string, number>();
+  let topCursor = 0;
+  let newestCursor = 0;
+
+  for (const order of ['top', 'newest'] as const) {
+    const generated = generateCommentContinuation(videoId, order);
+    if (generated) {
+      pushToken(pageQueue, { token: generated, isReply: false, sort: order });
+    }
   }
+
+  const rankPage = (
+    order: CommentSortOrder | undefined,
+    orderedRootIds: string[],
+  ) => {
+    if (!order) return;
+
+    const ranks = order === 'newest' ? newestRanks : topRanks;
+    for (const id of orderedRootIds) {
+      if (ranks.has(id)) continue;
+      ranks.set(id, order === 'newest' ? newestCursor++ : topCursor++);
+    }
+  };
+
+  // Replies keep the order YouTube returns them in. Pages for one thread are
+  // walked in sequence, so a per-thread cursor stays in step with them.
+  const rankReplies = (orderedReplyIds: string[]) => {
+    for (const id of orderedReplyIds) {
+      if (replyRanks.has(id)) continue;
+      const parent = id.slice(0, id.indexOf('.'));
+      const cursor = replyCursors.get(parent) ?? 0;
+      replyCursors.set(parent, cursor + 1);
+      replyRanks.set(id, cursor);
+    }
+  };
+
+  const withRanks = (comment: YouTubeComment): YouTubeComment => ({
+    ...comment,
+    topRank: topRanks.get(comment.id) ?? comment.topRank ?? null,
+    newestRank: newestRanks.get(comment.id) ?? comment.newestRank ?? null,
+    replyRank: replyRanks.get(comment.id) ?? comment.replyRank ?? null,
+    featured: featuredIds.has(comment.id) || comment.featured === true,
+    featuredReplyCount:
+      featuredReplyCounts.get(comment.id) ?? comment.featuredReplyCount ?? null,
+  });
 
   if (pageQueue.length === 0 && replyQueue.length === 0) {
     throw new Error(
@@ -1070,14 +1290,13 @@ export async function fetchAllVideoComments(
 
   let pages = 0;
   let rateLimited = false;
-  let followedSortToken = false;
 
   const fetchToken = async (next: QueuedToken): Promise<void> => {
     if (isCancelled?.()) return;
     if (getYouTubeVideoId(window.location.href) !== videoId) return;
-    if (seenTokens.has(next.token) || collected.size >= maxComments) return;
+    if (seenTokens.has(tokenChainKey(next)) || collected.size >= maxComments) return;
     if (pages >= MAX_CONTINUATION_PAGES || rateLimited) return;
-    seenTokens.add(next.token);
+    seenTokens.add(tokenChainKey(next));
     pages += 1;
 
     try {
@@ -1094,6 +1313,19 @@ export async function fetchAllVideoComments(
         totalCommentsLabel = parsed.totalCommentsLabel;
       }
 
+      rankPage(next.sort, parsed.orderedRootIds);
+      if (next.isReply) rankReplies(parsed.orderedReplyIds);
+
+      // Everything this page carried is part of the listing it came from.
+      if (next.sort === 'top') {
+        for (const comment of parsed.comments) {
+          featuredIds.add(comment.id);
+          if (!comment.isReply && comment.replyCount) {
+            featuredReplyCounts.set(comment.id, comment.replyCount);
+          }
+        }
+      }
+
       const added: YouTubeComment[] = [];
       for (const comment of parsed.comments) {
         if (collected.size >= maxComments) break;
@@ -1105,14 +1337,17 @@ export async function fetchAllVideoComments(
         added.push(comment);
       }
 
-      if (!followedSortToken && parsed.sortToken) {
-        followedSortToken = true;
-        pageQueue.push(parsed.sortToken);
+      // A page's own continuation stays inside the same sort chain, so the
+      // ranking cursor keeps counting in YouTube's order.
+      for (const token of parsed.pageTokens) {
+        const tagged = next.sort ? { ...token, sort: next.sort } : token;
+        if (tagged.isReply) replyQueue.push(tagged);
+        else pageQueue.push(tagged);
       }
-
-      for (const token of parsed.pageTokens) pageQueue.push(token);
-      for (const token of parsed.replyTokens) replyQueue.push(token);
-      onProgress(collected.size, totalCommentsLabel, added);
+      for (const token of parsed.replyTokens) {
+        replyQueue.push(next.sort ? { ...token, sort: next.sort } : token);
+      }
+      onProgress(collected.size, totalCommentsLabel, added.map(withRanks));
     } catch (error) {
       const message = error instanceof Error ? error.message : '';
       if (message.includes('rate-limited')) {
@@ -1132,24 +1367,43 @@ export async function fetchAllVideoComments(
 
   let pageActive = 0;
   let replyActive = 0;
+  const chainActive = new Map<string, number>();
   const running = new Set<Promise<void>>();
+  const chainOf = (next: QueuedToken) => next.sort ?? 'unsorted';
 
   const startToken = (next: QueuedToken, kind: 'page' | 'reply') => {
-    if (kind === 'page') pageActive += 1;
-    else replyActive += 1;
+    if (kind === 'page') {
+      pageActive += 1;
+      chainActive.set(chainOf(next), (chainActive.get(chainOf(next)) ?? 0) + 1);
+    } else {
+      replyActive += 1;
+    }
 
     const task = fetchToken(next).finally(() => {
-      if (kind === 'page') pageActive -= 1;
-      else replyActive -= 1;
+      if (kind === 'page') {
+        pageActive -= 1;
+        chainActive.set(chainOf(next), (chainActive.get(chainOf(next)) ?? 1) - 1);
+      } else {
+        replyActive -= 1;
+      }
       running.delete(task);
     });
     running.add(task);
   };
 
   const pump = () => {
+    // One page at a time per sort chain. Pages have to be walked in sequence
+    // for the recorded positions to stay in YouTube's order, and it keeps both
+    // orders advancing together instead of one starving the other.
     while (pageActive < PAGE_CONCURRENCY && pageQueue.length > 0 && canContinue()) {
-      const next = pageQueue.shift();
-      if (next) startToken(next, 'page');
+      const index = pageQueue.findIndex(
+        (item) => (chainActive.get(chainOf(item)) ?? 0) === 0,
+      );
+      if (index === -1) break;
+
+      const [next] = pageQueue.splice(index, 1);
+      if (!next) break;
+      startToken(next, 'page');
     }
 
     while (
@@ -1175,7 +1429,7 @@ export async function fetchAllVideoComments(
   }
 
   return {
-    comments: [...collected.values()],
+    comments: [...collected.values()].map(withRanks),
     truncated:
       rateLimited ||
       pageQueue.length > 0 ||

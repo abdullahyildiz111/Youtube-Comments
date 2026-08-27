@@ -45,8 +45,45 @@ Use `npm run build` to create a production Chromium build in `.output/`.
   **Summarize all comments**.
 - Replies are loaded in small parallel batches after the main thread. The
   fetch is capped at 2,000 comments.
+- The popup has the same **Sort by** control YouTube puts above its comments,
+  with the same two options: **Top** and **Newest**. "Top" is a ranking
+  YouTube computes on its side, not a like-count sort, so the extension asks
+  YouTube for both orders and lists comments in the position YouTube gave
+  them. Switching between the two is instant and refetches nothing.
+- Because both orders are requested, a video costs roughly twice as many
+  top-level page requests as before. Replies are still fetched once.
+- Comments that YouTube's "Top" ranking leaves out are still kept. They are
+  listed after the ranked ones instead of being dropped. The **Hide spam**
+  switch drops them from the list and from what gets summarized.
+- Reply continuations inherit the sort of the listing they were found on, so
+  the Top chain returns YouTube's moderated replies and the Newest chain
+  returns the same thread plus what YouTube keeps out of it. That difference
+  is where banned and held-for-review replies live, and it is what **Hide
+  spam** removes. On one sampled thread YouTube reported 27 replies under Top
+  and 31 under Newest, and the four extras were exactly the hidden ones.
+- Replies are only dropped when the remaining count matches the reply total
+  YouTube's own Top listing reports. A thread the Top pass has not fully
+  walked is left whole rather than guessing, and the switch does nothing until
+  the full thread has loaded.
+- The switch is YouTube's judgement, not the extension's. The set it hides
+  also contains ordinary comments with no likes, so it is not a perfect spam
+  classifier.
+- Pinned comments show YouTube's own wording ("Pinned by @channel"), and
+  verified authors, channel-owner authors and creator hearts are marked. None
+  of these arrive on the comment record itself: pinning is sent on the
+  rendered thread and the heart in a separate toolbar entity, so they are read
+  from there and merged in.
 - YouTube's on-page total is an estimate. Hidden, held-for-review, and some
   low-ranked comments are often never returned.
+- Requests are signed the same way youtube.com signs its own, using the
+  SAPISID cookie already in the tab. YouTube ranks "Top" per viewer, so an
+  unsigned request comes back in the signed-out ranking and the order will not
+  match the page. The signature is built in the page and sent only to
+  youtube.com. If the cookie is unavailable the thread still loads, just in
+  the signed-out order.
+- Reply counts come from YouTube and can differ from the number the page
+  showed when it loaded, because the page does not refresh them. YouTube's own
+  Top and Newest pages sometimes disagree by a reply or two as well.
 - These requests use the same YouTube session as the tab. Loading one video is
   similar to scrolling the comments section quickly. Do not hammer many videos
   in a row.

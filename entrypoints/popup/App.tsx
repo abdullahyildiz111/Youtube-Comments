@@ -11,12 +11,20 @@ import {
   type SummaryReadyMessage,
   type ScrollToCommentsResponse,
   type SummarizeLoadedResponse,
+  COMMENT_SORT_OPTIONS,
+  DEFAULT_COMMENT_SORT_ORDER,
   getYouTubeVideoId,
   groupCommentsForDisplay,
+  type CommentSortOrder,
   type CommentThread,
   type YouTubeComment,
 } from '@/lib/comments';
-import { AUTO_SUMMARIZE_KEY, setAutoSummarizeEnabled } from '@/lib/settings';
+import {
+  AUTO_SUMMARIZE_KEY,
+  HIDE_FILTERED_KEY,
+  setAutoSummarizeEnabled,
+  setHideFilteredComments,
+} from '@/lib/settings';
 import {
   SUMMARY_CACHE_KEY,
   readSummaryCache,
@@ -61,6 +69,88 @@ function CommentIcon() {
   );
 }
 
+function SortIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M21 5H3a1 1 0 000 2h18a1 1 0 100-2Zm-6 6H3a1 1 0 000 2h12a1 1 0 000-2Zm-6 6H3a1 1 0 000 2h6a1 1 0 000-2Z" />
+    </svg>
+  );
+}
+
+function CommentSortMenu({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: CommentSortOrder;
+  onChange: (next: CommentSortOrder) => void;
+  disabled: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
+
+  return (
+    <div className="sort-menu" ref={rootRef}>
+      <button
+        type="button"
+        className="sort-trigger"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label="Sort comments"
+        title="Sort comments"
+        disabled={disabled}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <SortIcon />
+        <span>Sort by</span>
+      </button>
+
+      {open && (
+        <div className="sort-options" role="listbox" aria-label="Sort comments">
+          {COMMENT_SORT_OPTIONS.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              role="option"
+              aria-selected={option.value === value}
+              className={`sort-option${option.value === value ? ' is-selected' : ''}`}
+              onClick={() => {
+                setOpen(false);
+                onChange(option.value);
+              }}
+            >
+              <span className="sort-option-title">{option.label}</span>
+              <span className="sort-option-subtitle">{option.description}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SparklesIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -90,10 +180,13 @@ function capturedCount(snapshot: CommentsSnapshot): number {
   return snapshot.capturedCount ?? snapshot.comments.length;
 }
 
-function listedThreadCount(snapshot: CommentsSnapshot): number {
+function listedThreadCount(
+  snapshot: CommentsSnapshot,
+  order: CommentSortOrder,
+): number {
   return typeof snapshot.threadCount === 'number'
     ? snapshot.threadCount
-    : groupCommentsForDisplay(snapshot.comments).length;
+    : groupCommentsForDisplay(snapshot.comments, order).length;
 }
 
 function repliesLabel(thread: CommentThread): string {
@@ -104,6 +197,38 @@ function repliesLabel(thread: CommentThread): string {
   return thread.replies.length === 1
     ? '1 reply'
     : `${thread.replies.length} replies`;
+}
+
+function PinIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M16 3v2h-1v6l2 2v2h-5v5l-1 1-1-1v-5H5v-2l2-2V5H6V3h10Z" />
+    </svg>
+  );
+}
+
+function VerifiedIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm-1.4 14.6L6.4 12.4l1.4-1.4 2.8 2.8 5.6-5.6 1.4 1.4-7 7Z" />
+    </svg>
+  );
+}
+
+function HeartIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35Z" />
+    </svg>
+  );
+}
+
+function ThumbUpIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M2 21h2.5V9H2v12Zm19.8-9.1c.13-.26.2-.55.2-.85V10c0-1.1-.9-2-2-2h-5.6l.94-4.5a1 1 0 0 0-.26-.9L14 1.5 7.6 7.9c-.38.38-.6.9-.6 1.44V19c0 1.1.9 2 2 2h8.2c.78 0 1.47-.45 1.79-1.14L21.8 11.9Z" />
+    </svg>
+  );
 }
 
 function CommentCard({ comment }: { comment: YouTubeComment }) {
@@ -119,17 +244,34 @@ function CommentCard({ comment }: { comment: YouTubeComment }) {
         )}
       </div>
       <div className="comment-body">
+        {comment.isPinned && (
+          <div className="pinned-row">
+            <PinIcon />
+            <span>{comment.pinnedLabel || 'Pinned'}</span>
+          </div>
+        )}
         <div className="comment-meta">
-          <strong>{comment.author}</strong>
+          <strong className={comment.isChannelOwner ? 'is-owner' : undefined}>
+            {comment.author}
+          </strong>
+          {comment.isVerified && (
+            <span className="verified" title="Verified">
+              <VerifiedIcon />
+            </span>
+          )}
           {comment.publishedAt && <span>{comment.publishedAt}</span>}
-        </div>
-        <div className="badges">
-          {comment.isPinned && <span>Pinned</span>}
-          {comment.isCreatorHearted && <span>Creator heart</span>}
         </div>
         <p>{comment.text}</p>
         <div className="comment-stats">
-          <span>{comment.likeCount ?? '0'} likes</span>
+          <span className="stat-likes">
+            <ThumbUpIcon />
+            {comment.likeCount ?? '0'}
+          </span>
+          {comment.isCreatorHearted && (
+            <span className="stat-heart" title="Loved by the creator">
+              <HeartIcon />
+            </span>
+          )}
         </div>
       </div>
     </article>
@@ -171,6 +313,15 @@ function App() {
   const [expandedThreadIds, setExpandedThreadIds] = useState<Set<string>>(
     () => new Set(),
   );
+  // YouTube opens every video on "Top", so the popup does too.
+  const [sortOrder, setSortOrder] = useState<CommentSortOrder>(
+    DEFAULT_COMMENT_SORT_ORDER,
+  );
+  const sortOrderRef = useRef(sortOrder);
+  sortOrderRef.current = sortOrder;
+  const [hideFiltered, setHideFiltered] = useState(false);
+  const hideFilteredRef = useRef(hideFiltered);
+  hideFilteredRef.current = hideFiltered;
   const activeVideoId =
     state.kind === 'ready' ? state.snapshot.videoId : null;
   const activeVideoIdRef = useRef(activeVideoId);
@@ -196,6 +347,8 @@ function App() {
 
       const snapshot = (await browser.tabs.sendMessage(tab.id, {
         type: COMMENT_MESSAGES.getSnapshot,
+        sortOrder: sortOrderRef.current,
+        hideFilteredComments: hideFilteredRef.current,
       })) as CommentsSnapshot;
 
       setState({ kind: 'ready', snapshot, tabId: tab.id });
@@ -208,9 +361,12 @@ function App() {
 
   useEffect(() => {
     void loadSnapshot(true);
-    void browser.storage.local.get(AUTO_SUMMARIZE_KEY).then((stored) => {
-      setAutoSummarize(stored[AUTO_SUMMARIZE_KEY] === true);
-    });
+    void browser.storage.local
+      .get([AUTO_SUMMARIZE_KEY, HIDE_FILTERED_KEY])
+      .then((stored) => {
+        setAutoSummarize(stored[AUTO_SUMMARIZE_KEY] === true);
+        setHideFiltered(stored[HIDE_FILTERED_KEY] === true);
+      });
 
     const applySummary = (summary: SavedSummary | undefined) => {
       if (!summary || summary.videoId !== activeVideoIdRef.current) return;
@@ -281,6 +437,10 @@ function App() {
       .catch(() => {
         // A failed cache read should not block a new summary.
       });
+  }, [activeVideoId]);
+
+  useEffect(() => {
+    setSortOrder(DEFAULT_COMMENT_SORT_ORDER);
   }, [activeVideoId]);
 
   useEffect(() => {
@@ -615,7 +775,7 @@ function App() {
   visibleCountRef.current = visibleCount;
 
   const refreshVisibleComments = useCallback(
-    async (limit: number) => {
+    async (limit: number, order: CommentSortOrder = sortOrderRef.current) => {
       if (state.kind !== 'ready') return;
 
       try {
@@ -623,8 +783,11 @@ function App() {
           type: COMMENT_MESSAGES.getCommentsPage,
           offset: 0,
           limit,
+          sortOrder: order,
+          hideFilteredComments: hideFilteredRef.current,
         })) as CommentsPageResponse;
         if (response.videoId !== state.snapshot.videoId) return;
+        if (response.sortOrder !== sortOrderRef.current) return;
         setPageComments(response.comments);
       } catch {
         // The popup can close or the tab can change while a page request is in flight.
@@ -645,7 +808,7 @@ function App() {
   const loadMoreComments = useCallback(async () => {
     if (state.kind !== 'ready' || loadingMoreRef.current) return;
 
-    const total = listedThreadCount(state.snapshot);
+    const total = listedThreadCount(state.snapshot, sortOrderRef.current);
     const visible = visibleCountRef.current;
     if (visible >= total) return;
 
@@ -656,9 +819,12 @@ function App() {
         type: COMMENT_MESSAGES.getCommentsPage,
         offset: 0,
         limit: nextVisible,
+        sortOrder: sortOrderRef.current,
+        hideFilteredComments: hideFilteredRef.current,
       })) as CommentsPageResponse;
 
       if (response.videoId !== state.snapshot.videoId) return;
+      if (response.sortOrder !== sortOrderRef.current) return;
       if (response.comments.length === 0) {
         setVisibleCount(Math.min(visible, total));
         return;
@@ -674,7 +840,8 @@ function App() {
   }, [state]);
 
   const canLoadMore =
-    state.kind === 'ready' && visibleCount < listedThreadCount(state.snapshot);
+    state.kind === 'ready' &&
+    visibleCount < listedThreadCount(state.snapshot, sortOrder);
 
   useEffect(() => {
     const list = listRef.current;
@@ -700,8 +867,21 @@ function App() {
         : state.kind === 'ready'
           ? state.snapshot.comments
           : [];
-    return groupCommentsForDisplay(source).slice(0, visibleCount);
-  }, [pageComments, visibleCount, state]);
+    return groupCommentsForDisplay(source, sortOrder).slice(0, visibleCount);
+  }, [pageComments, visibleCount, state, sortOrder]);
+
+  // Switching order rewinds the list to the top, the way YouTube reloads the
+  // thread when you pick a different sort.
+  const changeSortOrder = (next: CommentSortOrder) => {
+    if (next === sortOrder) return;
+
+    sortOrderRef.current = next;
+    setSortOrder(next);
+    setVisibleCount(COMMENTS_PAGE_SIZE);
+    setExpandedThreadIds(new Set());
+    listRef.current?.scrollTo({ top: 0 });
+    void refreshVisibleComments(COMMENTS_PAGE_SIZE, next);
+  };
 
   const toggleThread = (id: string) => {
     setExpandedThreadIds((current) => {
@@ -714,6 +894,12 @@ function App() {
 
   const isLoadingAll =
     state.kind === 'ready' && state.snapshot.status === 'loading-all';
+  // Only a complete walk of the thread can tell a filtered comment apart from
+  // one that simply has not been fetched.
+  const canFilter =
+    state.kind === 'ready' &&
+    state.snapshot.fetchedAll &&
+    !state.snapshot.truncated;
   const isBusy = isLoadingAll || summaryState.kind === 'working' || chatSending;
   const commentsDisabled =
     state.kind === 'ready' && state.snapshot.status === 'no-comments';
@@ -1012,11 +1198,18 @@ function App() {
                 <section className="comments-section">
                   <div className="section-heading">
                     <div>
-                      <h2>
-                        {state.snapshot.fetchedAll
-                          ? 'Loaded comments'
-                          : 'Captured comments'}
-                      </h2>
+                      <div className="section-title-row">
+                        <h2>
+                          {state.snapshot.fetchedAll
+                            ? 'Loaded comments'
+                            : 'Captured comments'}
+                        </h2>
+                        <CommentSortMenu
+                          value={sortOrder}
+                          onChange={changeSortOrder}
+                          disabled={isLoadingAll}
+                        />
+                      </div>
                       <p>
                         {state.snapshot.truncated
                           ? `Stopped at ${MAX_FETCHED_COMMENTS.toLocaleString()} comments`
@@ -1025,24 +1218,57 @@ function App() {
                             : 'Updates as comments load'}
                       </p>
                     </div>
-                    <div className="section-actions">
-                      <button
-                        className="text-button"
-                        onClick={handleLoadAll}
-                        disabled={isBusy}
-                      >
-                        {isLoadingAll ? 'Loading…' : 'Load all'}
-                      </button>
-                      <button
-                        className="text-button"
-                        onClick={jumpToComments}
-                        disabled={isBusy}
-                      >
-                        Jump to page
-                      </button>
-                    </div>
+                      <div className="section-actions">
+                        <label
+                          className={`auto-switch filter-switch${canFilter ? '' : ' is-unavailable'}`}
+                          title={
+                            canFilter
+                              ? "Hide everything YouTube keeps out of its Top listing. Its own Newest option calls that set potential spam, and it is where banned and held-for-review replies show up."
+                              : 'Load the whole thread first. Until then a comment missing from Top may simply be one the Top pass has not reached yet.'
+                          }
+                        >
+                          <span>Hide spam</span>
+                          <input
+                            type="checkbox"
+                            checked={hideFiltered}
+                            disabled={isBusy || !canFilter}
+                            onChange={() => {
+                              const next = !hideFiltered;
+                              hideFilteredRef.current = next;
+                              setHideFiltered(next);
+                              setVisibleCount(COMMENTS_PAGE_SIZE);
+                              void setHideFilteredComments(next);
+                              void refreshVisibleComments(COMMENTS_PAGE_SIZE);
+                            }}
+                          />
+                          <span className="switch-track" />
+                        </label>
+                      </div>
                   </div>
                   {threadError && <p className="thread-error">{threadError}</p>}
+
+                  <div className="section-subactions">
+                    {canFilter && state.snapshot.filteredCount > 0 && (
+                      <span className="filter-note">
+                        {state.snapshot.filteredCount}{' '}
+                        {hideFiltered ? 'spam hidden' : 'flagged by YouTube'}
+                      </span>
+                    )}
+                    <button
+                      className="text-button"
+                      onClick={handleLoadAll}
+                      disabled={isBusy}
+                    >
+                      {isLoadingAll ? 'Loading…' : 'Load all'}
+                    </button>
+                    <button
+                      className="text-button"
+                      onClick={jumpToComments}
+                      disabled={isBusy}
+                    >
+                      Jump to page
+                    </button>
+                  </div>
 
                   <div className="comment-list" ref={listRef}>
                     {visibleThreads.map((thread) => {
