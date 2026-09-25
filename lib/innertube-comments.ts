@@ -712,6 +712,7 @@ function commentFromEntity(
     ),
     isVerified: Boolean(author?.isVerified || author?.isArtist),
     isChannelOwner: Boolean(author?.isCreator),
+    replyLevel: commentIsReply ? Math.max(1, replyLevel || 1) : 0,
   };
 }
 
@@ -754,6 +755,7 @@ function commentFromRenderer(
     isCreatorHearted: Boolean(
       asRecord(renderer.creatorHeart)?.creatorHeartRenderer,
     ),
+    replyLevel: isReply ? 1 : 0,
   };
 }
 

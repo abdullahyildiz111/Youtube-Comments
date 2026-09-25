@@ -21,6 +21,7 @@ import {
   getYouTubeVideoId,
   groupCommentsForDisplay,
   isFeaturedByYouTube,
+  makeCommentThread,
   orderCommentsForDisplay,
   threadParentId,
   toCommentSortOrder,
@@ -322,10 +323,10 @@ export default defineContentScript({
       const listed = Number(thread.parent.featuredReplyCount);
       if (!Number.isFinite(listed) || listed !== replies.length) return thread;
 
-      return {
-        parent: { ...thread.parent, replyCount: String(listed) },
+      return makeCommentThread(
+        { ...thread.parent, replyCount: String(listed) },
         replies,
-      };
+      );
     };
 
     const listedThreads = (order: CommentSortOrder = sortOrder) => {

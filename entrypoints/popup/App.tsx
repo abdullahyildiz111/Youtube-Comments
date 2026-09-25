@@ -16,6 +16,7 @@ import {
   getYouTubeVideoId,
   groupCommentsForDisplay,
   type CommentSortOrder,
+  type CommentNode,
   type CommentThread,
   type YouTubeComment,
 } from '@/lib/comments';
@@ -275,6 +276,46 @@ function CommentCard({ comment }: { comment: YouTubeComment }) {
         </div>
       </div>
     </article>
+  );
+}
+
+// One nested reply: a gutter holding YouTube's elbow and continuation lines,
+// then the comment and any replies below it. Depth is not capped.
+function ReplyBranch({
+  nodes,
+  depth,
+}: {
+  nodes: CommentNode[];
+  depth: number;
+}) {
+  return (
+    <>
+      {nodes.map((node, index) => (
+        <div
+          className={[
+            'sub-thread',
+            index === nodes.length - 1 ? 'is-last' : '',
+            // A 420px popup cannot afford YouTube's full indent at every
+            // level, so deep branches keep the connector but narrow the step.
+            depth > 8 ? 'is-flush' : depth > 4 ? 'is-tight' : '',
+          ]
+            .filter(Boolean)
+            .join(' ')}
+          key={node.comment.id}
+        >
+          <div className="threadline" aria-hidden="true">
+            <span className="thread-connection" />
+            <span className="thread-continuation" />
+          </div>
+          <div className="sub-thread-content">
+            <CommentCard comment={node.comment} />
+            {node.children.length > 0 && (
+              <ReplyBranch nodes={node.children} depth={depth + 1} />
+            )}
+          </div>
+        </div>
+      ))}
+    </>
   );
 }
 
@@ -1289,10 +1330,9 @@ function App() {
                                 : `View ${repliesLabel(thread)}`}
                             </button>
                           )}
-                          {expanded &&
-                            thread.replies.map((reply) => (
-                              <CommentCard comment={reply} key={reply.id} />
-                            ))}
+                          {expanded && (
+                            <ReplyBranch nodes={thread.tree} depth={1} />
+                          )}
                         </div>
                       );
                     })}

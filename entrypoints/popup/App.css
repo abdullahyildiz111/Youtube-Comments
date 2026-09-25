@@ -840,9 +840,77 @@ main {
 }
 
 .comment-card.is-reply {
-  padding-left: 36px;
-  background: #fafafa;
-  box-shadow: inset 3px 0 0 #e4e4e8;
+  padding: 0 0 4px;
+  background: transparent;
+}
+
+/*
+ * Nested replies. Geometry, colours and the rounded elbow are taken from
+ * YouTube's own sub-thread styles so a branch reads the same way it does on
+ * the page: a fixed gutter per level holding an elbow into the comment and a
+ * line continuing down to the next sibling.
+ */
+.reply-tree {
+  padding: 0 13px 8px 13px;
+}
+
+.sub-thread {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  width: 100%;
+}
+
+.threadline {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  flex-shrink: 0;
+  width: 24px;
+}
+
+.thread-connection,
+.thread-continuation {
+  position: absolute;
+  right: 0;
+  border-left: 1px solid #e5e5e5;
+  box-sizing: border-box;
+}
+
+.thread-connection {
+  width: 50%;
+  height: 24px;
+  border-bottom: 1px solid #e5e5e5;
+  border-radius: 0 0 0 16px;
+}
+
+.thread-continuation {
+  width: 50%;
+  height: 100%;
+}
+
+/* The last reply on a level stops the line at its own elbow. */
+.sub-thread.is-last > .threadline .thread-continuation {
+  display: none;
+}
+
+.sub-thread:hover > .threadline .thread-connection,
+.sub-thread:hover > .threadline .thread-continuation {
+  border-color: #c9c9c9;
+}
+
+.sub-thread-content {
+  flex-grow: 1;
+  min-width: 0;
+  margin-top: 12px;
+  margin-left: 12px;
+}
+
+.sub-thread-content .avatar {
+  width: 24px;
+  height: 24px;
+  flex-basis: 24px;
+  font-size: 10px;
 }
 
 .replies-toggle {
@@ -1140,4 +1208,30 @@ footer {
 .filter-switch.is-unavailable {
   opacity: 0.45;
   cursor: default;
+}
+
+/*
+ * The popup is 420px wide where YouTube has over a thousand, so a long
+ * back-and-forth would squeeze the text to nothing at full indent. The first
+ * few levels use YouTube's spacing, then the step narrows so deep branches
+ * stay readable without losing the connector.
+ */
+.sub-thread.is-tight > .threadline {
+  width: 12px;
+}
+
+.sub-thread.is-tight > .sub-thread-content {
+  margin-left: 6px;
+}
+
+.sub-thread.is-flush > .threadline {
+  width: 8px;
+}
+
+.sub-thread.is-flush > .sub-thread-content {
+  margin-left: 0;
+}
+
+.comment-body p {
+  overflow-wrap: anywhere;
 }

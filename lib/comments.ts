@@ -83,6 +83,10 @@ export interface YouTubeComment {
   newestRank?: number | null;
   // Position inside its own thread, in the order YouTube returns replies.
   replyRank?: number | null;
+  // How deep the reply sits. YouTube returns a thread as a flat list in
+  // display order with a depth on each entry, so the nesting is rebuilt from
+  // the two together. A top-level comment is 0.
+  replyLevel?: number;
   // True when the comment came back through YouTube's "Top" listing, which is
   // its moderated set. Replies reached through "Newest" only are the ones
   // YouTube describes as "including potential spam" - banned and held-for-
@@ -269,28 +273,112 @@ function compareUnranked(
   return likeCountValue(second.likeCount) - likeCountValue(first.likeCount);
 }
 
+export interface CommentNode {
+  comment: YouTubeComment;
+  children: CommentNode[];
+}
+
 export interface CommentThread {
   parent: YouTubeComment;
+  // Every reply in the thread, flat and in YouTube's order.
   replies: YouTubeComment[];
+  // The same replies nested for display.
+  tree: CommentNode[];
+}
+
+interface PlacedReply {
+  node: CommentNode;
+  depth: number;
+}
+
+// A reply addressed to someone opens with their handle, which is how YouTube
+// decides what to nest under: every reply in a thread comes back at the same
+// depth, and the mention is the only thing tying one to another.
+function mentionedParent(
+  text: string,
+  placed: PlacedReply[],
+): PlacedReply | null {
+  const opening = text.replace(/^[\s\u200B-\u200D\uFEFF]+/, '');
+  if (!opening.startsWith('@')) return null;
+
+  // Most recent first, so a repeated handle attaches to the latest reply.
+  for (let index = placed.length - 1; index >= 0; index -= 1) {
+    const author = placed[index]?.node.comment.author;
+    if (!author || !author.startsWith('@') || !opening.startsWith(author)) continue;
+
+    // "@bob" must not swallow a reply addressed to "@bobby".
+    const next = opening.charAt(author.length);
+    if (next === '' || !/[\p{L}\p{N}._-]/u.test(next)) return placed[index] ?? null;
+  }
+
+  return null;
+}
+
+// Fallback for threads where YouTube states a depth instead.
+function statedParent(
+  replyLevel: number | undefined,
+  placed: PlacedReply[],
+): PlacedReply | null {
+  const stated =
+    typeof replyLevel === 'number' && Number.isFinite(replyLevel)
+      ? Math.floor(replyLevel)
+      : 1;
+  if (stated <= 1 || placed.length === 0) return null;
+
+  for (let index = placed.length - 1; index >= 0; index -= 1) {
+    if (placed[index]?.depth === stated - 1) return placed[index] ?? null;
+  }
+
+  // A depth that skips a level hangs off the most recent reply rather than
+  // being orphaned at the top of the thread.
+  return placed[placed.length - 1] ?? null;
+}
+
+// YouTube returns a thread as a flat list in display order. Nesting is rebuilt
+// from who each reply addresses, which chains naturally: a reply to a reply to
+// a reply keeps going as deep as the conversation does.
+export function buildReplyTree(replies: YouTubeComment[]): CommentNode[] {
+  const roots: CommentNode[] = [];
+  const placed: PlacedReply[] = [];
+
+  for (const reply of replies) {
+    const node: CommentNode = { comment: reply, children: [] };
+    const parent =
+      mentionedParent(reply.text, placed) ??
+      statedParent(reply.replyLevel, placed);
+
+    if (parent) parent.node.children.push(node);
+    else roots.push(node);
+
+    placed.push({ node, depth: parent ? parent.depth + 1 : 1 });
+  }
+
+  return roots;
+}
+export function makeCommentThread(
+  parent: YouTubeComment,
+  replies: YouTubeComment[],
+): CommentThread {
+  return { parent, replies, tree: buildReplyTree(replies) };
 }
 
 export function groupCommentsForDisplay(
   comments: YouTubeComment[],
   order: CommentSortOrder = DEFAULT_COMMENT_SORT_ORDER,
 ): CommentThread[] {
-  const threads: CommentThread[] = [];
+  const grouped: Array<{ parent: YouTubeComment; replies: YouTubeComment[] }> = [];
 
   for (const comment of orderCommentsForDisplay(comments, order)) {
     if (!comment.isReply) {
-      threads.push({ parent: comment, replies: [] });
+      grouped.push({ parent: comment, replies: [] });
       continue;
     }
 
-    const current = threads[threads.length - 1];
+    const current = grouped[grouped.length - 1];
     if (current) current.replies.push(comment);
   }
 
-  return threads;
+  return grouped.map((thread) => makeCommentThread(thread.parent, thread.replies));
 }
 
 export function flattenCommentThreads(threads: CommentThread[]): YouTubeComment[] {

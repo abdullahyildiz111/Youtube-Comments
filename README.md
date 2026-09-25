@@ -73,6 +73,14 @@ Use `npm run build` to create a production Chromium build in `.output/`.
   of these arrive on the comment record itself: pinning is sent on the
   rendered thread and the heart in a separate toolbar entity, so they are read
   from there and merged in.
+- Replies are shown as a tree with the same connector lines YouTube draws,
+  and the nesting is not capped. YouTube returns every reply in a thread at
+  the same depth, so the structure is rebuilt from the handle each reply opens
+  with, which is what YouTube itself keys on. Real threads reach eleven levels
+  on a busy video.
+- The popup is 420px wide against YouTube's thousand or more, so the first few
+  levels use YouTube's spacing and the step narrows after that. Deep replies
+  keep their connector without squeezing the text away.
 - YouTube's on-page total is an estimate. Hidden, held-for-review, and some
   low-ranked comments are often never returned.
 - Requests are signed the same way youtube.com signs its own, using the
