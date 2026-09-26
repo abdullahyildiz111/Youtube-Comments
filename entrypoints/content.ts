@@ -123,6 +123,7 @@ function areCommentsEqual(
     first.likeCount === second.likeCount &&
     first.replyCount === second.replyCount &&
     first.parentId === second.parentId &&
+    first.replyToId === second.replyToId &&
     first.isReply === second.isReply &&
     first.isPinned === second.isPinned &&
     first.pinnedLabel === second.pinnedLabel &&

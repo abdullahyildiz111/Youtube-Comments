@@ -69,6 +69,10 @@ export interface YouTubeComment {
   likeCount: string | null;
   replyCount: string | null;
   parentId: string | null;
+  // The comment this reply is actually attached to. YouTube nests that in
+  // subThreads, and it can be another reply. parentId stays the top-level
+  // comment so the whole thread still groups together.
+  replyToId?: string | null;
   isReply: boolean;
   isPinned: boolean;
   // YouTube's own wording, e.g. "Pinned by @RickAstleyYT".
@@ -291,9 +295,8 @@ interface PlacedReply {
   depth: number;
 }
 
-// A reply addressed to someone opens with their handle, which is how YouTube
-// decides what to nest under: every reply in a thread comes back at the same
-// depth, and the mention is the only thing tying one to another.
+// Used only when YouTube did not say which comment a reply belongs to (a DOM
+// scrape). A reply that opens with a handle is attached to that person.
 function mentionedParent(
   text: string,
   placed: PlacedReply[],
@@ -334,18 +337,39 @@ function statedParent(
   return placed[placed.length - 1] ?? null;
 }
 
-// YouTube returns a thread as a flat list in display order. Nesting is rebuilt
-// from who each reply addresses, which chains naturally: a reply to a reply to
-// a reply keeps going as deep as the conversation does.
-export function buildReplyTree(replies: YouTubeComment[]): CommentNode[] {
+// YouTube's reply payload nests each response under the comment it answers.
+// That parent is another reply for anything deeper than a direct response.
+function buildStructuredReplyTree(replies: YouTubeComment[]): CommentNode[] {
+  const nodes = new Map<string, CommentNode>();
+  for (const reply of replies) {
+    nodes.set(reply.id, { comment: reply, children: [] });
+  }
+
+  const roots: CommentNode[] = [];
+  for (const reply of replies) {
+    const node = nodes.get(reply.id);
+    if (!node) continue;
+    const parent = reply.replyToId ? nodes.get(reply.replyToId) : undefined;
+    if (parent && parent !== node) parent.children.push(node);
+    else roots.push(node);
+  }
+
+  return roots;
+}
+
+// Fallback when the payload did not name a parent. Depth comes from YouTube's
+// replyLevel; a leading @handle is only used when even that is missing.
+function buildInferredReplyTree(replies: YouTubeComment[]): CommentNode[] {
   const roots: CommentNode[] = [];
   const placed: PlacedReply[] = [];
 
   for (const reply of replies) {
     const node: CommentNode = { comment: reply, children: [] };
-    const parent =
-      mentionedParent(reply.text, placed) ??
-      statedParent(reply.replyLevel, placed);
+    const levelKnown =
+      typeof reply.replyLevel === 'number' && Number.isFinite(reply.replyLevel);
+    const parent = levelKnown
+      ? statedParent(reply.replyLevel, placed)
+      : mentionedParent(reply.text, placed);
 
     if (parent) parent.node.children.push(node);
     else roots.push(node);
@@ -354,6 +378,13 @@ export function buildReplyTree(replies: YouTubeComment[]): CommentNode[] {
   }
 
   return roots;
+}
+
+export function buildReplyTree(replies: YouTubeComment[]): CommentNode[] {
+  if (replies.some((reply) => reply.replyToId)) {
+    return buildStructuredReplyTree(replies);
+  }
+  return buildInferredReplyTree(replies);
 }
 export function makeCommentThread(
   parent: YouTubeComment,

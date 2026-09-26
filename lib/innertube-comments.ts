@@ -914,6 +914,166 @@ function pinnedLabelsFromItems(
   return pinned;
 }
 
+function commentIdsByEntityKey(data: unknown): Map<string, string> {
+  const byKey = new Map<string, string>();
+  const mutations =
+    asRecord(asRecord(asRecord(data)?.frameworkUpdates)?.entityBatchUpdate)
+      ?.mutations;
+  if (!Array.isArray(mutations)) return byKey;
+
+  for (const mutation of mutations) {
+    const record = asRecord(mutation);
+    const payload = asRecord(asRecord(record?.payload)?.commentEntityPayload);
+    if (!payload) continue;
+    const id = canonicalCommentId(
+      asRecord(payload.properties)?.commentId,
+      payload.commentId,
+    );
+    const key = readString(payload.key, record?.entityKey);
+    if (id && key) byKey.set(key, id);
+  }
+
+  return byKey;
+}
+
+function unwrapCommentNode(node: unknown): Record<string, unknown> | null {
+  const record = asRecord(node);
+  if (!record) return null;
+  if (record.richItemRenderer) {
+    return unwrapCommentNode(asRecord(record.richItemRenderer)?.content);
+  }
+  return record;
+}
+
+function commentViewModelOf(
+  record: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const thread = asRecord(record.commentThreadRenderer);
+  const source = thread ?? record;
+  const outer =
+    asRecord(source.commentViewModel) ??
+    asRecord(asRecord(source.comment)?.commentViewModel);
+  return asRecord(outer?.commentViewModel) ?? outer;
+}
+
+function walkedCommentId(
+  record: Record<string, unknown>,
+  byKey: Map<string, string>,
+): string {
+  const thread = asRecord(record.commentThreadRenderer);
+  const source = thread ?? record;
+  const renderer =
+    asRecord(asRecord(source.comment)?.commentRenderer) ??
+    asRecord(source.commentRenderer);
+  const viewModel = commentViewModelOf(record);
+  const direct = canonicalCommentId(renderer?.commentId, viewModel?.commentId);
+  if (direct) return direct;
+  const key = readString(viewModel?.commentKey);
+  return key ? byKey.get(key) ?? '' : '';
+}
+
+function repliesRendererOf(
+  record: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const thread = asRecord(record.commentThreadRenderer);
+  return (
+    asRecord(asRecord(thread?.replies)?.commentRepliesRenderer) ??
+    asRecord(asRecord(record.replies)?.commentRepliesRenderer) ??
+    asRecord(record.commentRepliesRenderer)
+  );
+}
+
+interface WalkedComment {
+  id: string;
+  replyToId: string | null;
+}
+
+// YouTube returns a reply thread as a tree: each commentThreadRenderer carries
+// the responses to that comment in replies.commentRepliesRenderer.subThreads.
+// Flattening that list drops the parent, so a reply to a reply is drawn as if
+// it answered whoever happened to be written above it.
+function walkCommentItems(
+  nodes: unknown[],
+  byKey: Map<string, string>,
+  parentId: string | null,
+  into: WalkedComment[],
+  replyTokens: QueuedToken[],
+  comments: Map<string, YouTubeComment>,
+  seen: Set<string>,
+  depth = 0,
+): void {
+  if (depth > 30) return;
+
+  for (const node of nodes) {
+    const record = unwrapCommentNode(node);
+    if (!record) continue;
+
+    if (record.itemSectionRenderer) {
+      const contents = asRecord(record.itemSectionRenderer)?.contents;
+      if (Array.isArray(contents)) {
+        walkCommentItems(
+          contents,
+          byKey,
+          parentId,
+          into,
+          replyTokens,
+          comments,
+          seen,
+          depth + 1,
+        );
+      }
+      continue;
+    }
+
+    if (record.continuationItemRenderer || record.continuationItemViewModel) {
+      if (parentId) {
+        const token = continuationFrom(continuationItem(record) ?? record);
+        if (token) {
+          pushToken(replyTokens, { ...token, isReply: true, parentId });
+        }
+      }
+      continue;
+    }
+
+    const id = walkedCommentId(record, byKey);
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      into.push({ id, replyToId: parentId });
+      for (const comment of commentsFromItems([record], Boolean(parentId))) {
+        if (!comments.has(comment.id)) comments.set(comment.id, comment);
+      }
+    }
+
+    const replies = repliesRendererOf(record);
+    const ownerId = id || parentId;
+    if (!replies || !ownerId) continue;
+
+    for (const key of ['contents', 'subThreads', 'continuations'] as const) {
+      const nested = replies[key];
+      if (!Array.isArray(nested)) continue;
+      walkCommentItems(
+        nested,
+        byKey,
+        ownerId,
+        into,
+        replyTokens,
+        comments,
+        seen,
+        depth + 1,
+      );
+    }
+
+    const viewToken = continuationFrom(replies.viewReplies);
+    if (viewToken) {
+      pushToken(replyTokens, {
+        ...viewToken,
+        isReply: true,
+        parentId: ownerId,
+      });
+    }
+  }
+}
+
 function orderedIdsFromItems(items: Record<string, unknown>[]): string[] {
   const ids: string[] = [];
 
@@ -947,6 +1107,9 @@ function parseNextResponse(
   const orderedRootIds: string[] = [];
   const orderedReplyIds: string[] = [];
   const pinnedLabels = new Map<string, string>();
+  const walked: WalkedComment[] = [];
+  const seenWalked = new Set<string>();
+  const byKey = commentIdsByEntityKey(data);
   let sortToken = extractSortToken(data);
   let totalCommentsLabel = extractCommentsCountLabel(data);
 
@@ -962,11 +1125,38 @@ function parseNextResponse(
       if (comment) comments.set(id, { ...comment, isPinned: true, pinnedLabel: label });
       else pinnedLabels.set(id, label);
     }
-    for (const id of orderedIdsFromItems(items)) {
-      if (id.includes('.')) orderedReplyIds.push(id);
-      else orderedRootIds.push(id);
+    walkCommentItems(
+      list,
+      byKey,
+      isReply ? parentId ?? null : null,
+      walked,
+      replyTokens,
+      comments,
+      seenWalked,
+    );
+    const seenRoot = new Set(orderedRootIds);
+    const seenReply = new Set(orderedReplyIds);
+    for (const entry of walked) {
+      const isNestedReply = Boolean(entry.replyToId) || entry.id.includes('.');
+      if (isNestedReply) {
+        if (seenReply.has(entry.id)) continue;
+        seenReply.add(entry.id);
+        orderedReplyIds.push(entry.id);
+      } else if (!seenRoot.has(entry.id)) {
+        seenRoot.add(entry.id);
+        orderedRootIds.push(entry.id);
+      }
     }
-    collectReplyTokens(items, replyTokens);
+    for (const id of orderedIdsFromItems(items)) {
+      if (id.includes('.')) {
+        if (seenReply.has(id)) continue;
+        seenReply.add(id);
+        orderedReplyIds.push(id);
+      } else if (!seenRoot.has(id)) {
+        seenRoot.add(id);
+        orderedRootIds.push(id);
+      }
+    }
     for (const token of extractPageTokens(items, isReply)) {
       pushToken(pageTokens, token);
     }
@@ -977,10 +1167,24 @@ function parseNextResponse(
     if (comment) comments.set(id, { ...comment, isPinned: true, pinnedLabel: label });
   }
 
+  for (const entry of walked) {
+    if (!entry.replyToId) continue;
+    const comment = comments.get(entry.id);
+    if (!comment) continue;
+    comments.set(entry.id, {
+      ...comment,
+      replyToId: entry.replyToId,
+      isReply: true,
+    });
+  }
+
   if (parentId) {
     for (const [id, comment] of comments) {
       if (id === parentId || comment.parentId) continue;
       comments.set(id, { ...comment, parentId, isReply: true });
+    }
+    for (const token of pageTokens) {
+      if (token.isReply && !token.parentId) token.parentId = parentId;
     }
     for (const token of replyTokens) {
       if (!token.parentId) token.parentId = parentId;
@@ -1227,7 +1431,10 @@ export async function fetchAllVideoComments(
   // YouTube's ranking leaves out.
   const topRanks = new Map<string, number>();
   const newestRanks = new Map<string, number>();
-  const replyRanks = new Map<string, number>();
+  // Reply order is recorded per listing. Top is what the page shows by
+  // default, so it wins; Newest only places replies Top never returned.
+  const topReplyRanks = new Map<string, number>();
+  const newestReplyRanks = new Map<string, number>();
   // Every comment YouTube served through the Top listing, replies included.
   // Reply continuations carry the sort of the page they were found on, so the
   // Top chain returns the moderated set and the Newest chain returns the same
@@ -1236,7 +1443,8 @@ export async function fetchAllVideoComments(
   // Reply totals as the Top listing reports them, used to confirm we have the
   // whole moderated thread before hiding anything from it.
   const featuredReplyCounts = new Map<string, string>();
-  const replyCursors = new Map<string, number>();
+  const topReplyCursors = new Map<string, number>();
+  const newestReplyCursors = new Map<string, number>();
   let topCursor = 0;
   let newestCursor = 0;
 
@@ -1260,15 +1468,22 @@ export async function fetchAllVideoComments(
     }
   };
 
-  // Replies keep the order YouTube returns them in. Pages for one thread are
-  // walked in sequence, so a per-thread cursor stays in step with them.
-  const rankReplies = (orderedReplyIds: string[]) => {
+  // Replies keep the order YouTube returns them in, including replies that
+  // sit inside another reply. Pages for one thread are walked in sequence,
+  // so a per-thread cursor stays in step with them.
+  const rankReplies = (
+    orderedReplyIds: string[],
+    sort?: CommentSortOrder,
+  ) => {
+    const ranks = sort === 'newest' ? newestReplyRanks : topReplyRanks;
+    const cursors = sort === 'newest' ? newestReplyCursors : topReplyCursors;
     for (const id of orderedReplyIds) {
-      if (replyRanks.has(id)) continue;
-      const parent = id.slice(0, id.indexOf('.'));
-      const cursor = replyCursors.get(parent) ?? 0;
-      replyCursors.set(parent, cursor + 1);
-      replyRanks.set(id, cursor);
+      if (ranks.has(id)) continue;
+      const separator = id.indexOf('.');
+      const parent = separator > 0 ? id.slice(0, separator) : id;
+      const cursor = cursors.get(parent) ?? 0;
+      cursors.set(parent, cursor + 1);
+      ranks.set(id, cursor);
     }
   };
 
@@ -1276,7 +1491,11 @@ export async function fetchAllVideoComments(
     ...comment,
     topRank: topRanks.get(comment.id) ?? comment.topRank ?? null,
     newestRank: newestRanks.get(comment.id) ?? comment.newestRank ?? null,
-    replyRank: replyRanks.get(comment.id) ?? comment.replyRank ?? null,
+    replyRank:
+      topReplyRanks.get(comment.id) ??
+      newestReplyRanks.get(comment.id) ??
+      comment.replyRank ??
+      null,
     featured: featuredIds.has(comment.id) || comment.featured === true,
     featuredReplyCount:
       featuredReplyCounts.get(comment.id) ?? comment.featuredReplyCount ?? null,
@@ -1316,7 +1535,9 @@ export async function fetchAllVideoComments(
       }
 
       rankPage(next.sort, parsed.orderedRootIds);
-      if (next.isReply) rankReplies(parsed.orderedReplyIds);
+      if (parsed.orderedReplyIds.length > 0) {
+        rankReplies(parsed.orderedReplyIds, next.sort);
+      }
 
       // Everything this page carried is part of the listing it came from.
       if (next.sort === 'top') {
@@ -1331,8 +1552,14 @@ export async function fetchAllVideoComments(
       const added: YouTubeComment[] = [];
       for (const comment of parsed.comments) {
         if (collected.size >= maxComments) break;
-        if (collected.has(comment.id)) {
-          collected.set(comment.id, comment);
+        const existing = collected.get(comment.id);
+        if (existing) {
+          // The first listing to name a parent keeps it. A later pass can
+          // still fill the parent in when the first one never saw the branch.
+          collected.set(comment.id, {
+            ...comment,
+            replyToId: existing.replyToId || comment.replyToId || null,
+          });
           continue;
         }
         collected.set(comment.id, comment);
