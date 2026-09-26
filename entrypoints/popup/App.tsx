@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  commentExportFileName,
+  commentsToCsv,
+  commentsToPdf,
+  downloadBlob,
+  rowsForExport,
+  type CommentExportMeta,
+} from '@/lib/export-comments';
+import {
   COMMENT_MESSAGES,
   MAX_FETCHED_COMMENTS,
   MAX_SNAPSHOT_COMMENTS,
@@ -419,6 +427,7 @@ function App() {
     kind: 'idle',
   });
   const [threadError, setThreadError] = useState<string | null>(null);
+  const [exportKind, setExportKind] = useState<'csv' | 'pdf' | null>(null);
   const [autoSummarize, setAutoSummarize] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatSending, setChatSending] = useState(false);
@@ -798,6 +807,64 @@ function App() {
       });
   };
 
+  const exportComments = async (kind: 'csv' | 'pdf') => {
+    if (state.kind !== 'ready' || exportKind) return;
+
+    const { snapshot, tabId } = state;
+    const spamHidden = hideFilteredRef.current && canFilter;
+    setExportKind(kind);
+    setThreadError(null);
+
+    try {
+      const response = (await browser.tabs.sendMessage(tabId, {
+        type: COMMENT_MESSAGES.getCommentsPage,
+        offset: 0,
+        limit: MAX_FETCHED_COMMENTS,
+        sortOrder: sortOrderRef.current,
+        hideFilteredComments: spamHidden,
+      })) as CommentsPageResponse;
+
+      if (response.videoId !== snapshot.videoId) return;
+
+      const rows = rowsForExport(
+        groupCommentsForDisplay(response.comments, sortOrderRef.current),
+      );
+      if (rows.length === 0) {
+        setThreadError('No comments to export with the current filter.');
+        return;
+      }
+
+      const sortLabel =
+        COMMENT_SORT_OPTIONS.find(
+          (option) => option.value === sortOrderRef.current,
+        )?.label ?? 'Top';
+      const meta: CommentExportMeta = {
+        videoTitle: snapshot.videoTitle,
+        channelName: snapshot.channelName,
+        pageUrl: snapshot.pageUrl,
+        sortLabel,
+        spamHidden,
+        fetchedAll: snapshot.fetchedAll,
+        truncated: snapshot.truncated,
+        exportedAt: new Date(),
+      };
+      const filename = commentExportFileName(snapshot.videoTitle, kind);
+      const blob =
+        kind === 'csv'
+          ? new Blob([commentsToCsv(rows, meta)], {
+              type: 'text/csv;charset=utf-8',
+            })
+          : await commentsToPdf(rows, meta);
+      downloadBlob(blob, filename);
+    } catch {
+      setThreadError(
+        'Could not export comments. Refresh the YouTube tab, then try again.',
+      );
+    } finally {
+      setExportKind(null);
+    }
+  };
+
   const handleLoadAll = () => {
     if (state.kind !== 'ready') return;
     setThreadError(null);
@@ -1140,7 +1207,10 @@ function App() {
                 <p className="channel-name">{state.snapshot.channelName}</p>
               )}
 
-              <div className="metrics">
+              <div
+                className="metrics"
+                title="YouTube's total is an estimate and includes replies. Some comments are hidden or never returned by YouTube."
+              >
                 <div>
                   <strong>
                     {isLoadingAll
@@ -1158,10 +1228,6 @@ function App() {
                   <span>listed by YouTube</span>
                 </div>
               </div>
-              <p className="count-note">
-                YouTube&apos;s total is an estimate and includes replies. Some
-                comments are hidden or never returned by YouTube.
-              </p>
             </section>
 
             {commentsDisabled &&
@@ -1301,20 +1367,15 @@ function App() {
                   onClear={clearChat}
                 />
 
-                {capturedCount(state.snapshot) === 0 && (
+                {capturedCount(state.snapshot) === 0 && !isLoadingAll && (
                   <section className="empty-state">
                     <div className="empty-icon">
                       <CommentIcon />
                     </div>
-                    <h2>
-                      {isLoadingAll
-                        ? 'Loading the comment thread'
-                        : 'Load comments without scrolling'}
-                    </h2>
+                    <h2>Load comments without scrolling</h2>
                     <p>
-                      {isLoadingAll
-                        ? 'YouTube is sending the full thread in pages. This can take a little while on busy videos.'
-                        : 'The extension can request the comment thread from YouTube instead of waiting for comments to appear on the page.'}
+                      The extension can request the comment thread from YouTube
+                      instead of waiting for comments to appear on the page.
                     </p>
                     {threadError && <p className="thread-error">{threadError}</p>}
                     <div className="empty-actions">
@@ -1323,7 +1384,7 @@ function App() {
                         onClick={handleLoadAll}
                         disabled={isBusy}
                       >
-                        {isLoadingAll ? 'Loading…' : 'Load all comments'}
+                        Load all comments
                       </button>
                       <button
                         className="text-button"
@@ -1336,7 +1397,7 @@ function App() {
                   </section>
                 )}
 
-                {capturedCount(state.snapshot) > 0 && (
+                {(capturedCount(state.snapshot) > 0 || isLoadingAll) && (
                 <section className="comments-section">
                   <div className="section-heading">
                     <div>
@@ -1361,58 +1422,89 @@ function App() {
                       </p>
                     </div>
                       <div className="section-actions">
-                        <label
-                          className={`auto-switch filter-switch${canFilter ? '' : ' is-unavailable'}`}
-                          title={
-                            canFilter
-                              ? "Hide everything YouTube keeps out of its Top listing. Its own Newest option calls that set potential spam, and it is where banned and held-for-review replies show up."
-                              : 'Load the whole thread first. Until then a comment missing from Top may simply be one the Top pass has not reached yet.'
-                          }
-                        >
-                          <span>Hide spam</span>
-                          <input
-                            type="checkbox"
-                            checked={hideFiltered}
-                            disabled={isBusy || !canFilter}
-                            onChange={() => {
-                              const next = !hideFiltered;
-                              hideFilteredRef.current = next;
-                              setHideFiltered(next);
-                              setVisibleCount(COMMENTS_PAGE_SIZE);
-                              void setHideFilteredComments(next);
-                              void refreshVisibleComments(COMMENTS_PAGE_SIZE);
-                            }}
-                          />
-                          <span className="switch-track" />
-                        </label>
+                        <div className="filter-control">
+                          <label
+                            className={`auto-switch filter-switch${canFilter ? '' : ' is-unavailable'}`}
+                            title={
+                              canFilter
+                                ? "Hide everything YouTube keeps out of its Top listing. Its own Newest option calls that set potential spam, and it is where banned and held-for-review replies show up."
+                                : 'Load the whole thread first. Until then a comment missing from Top may simply be one the Top pass has not reached yet.'
+                            }
+                          >
+                            <span>Hide spam</span>
+                            <input
+                              type="checkbox"
+                              checked={hideFiltered}
+                              disabled={isBusy || !canFilter}
+                              onChange={() => {
+                                const next = !hideFiltered;
+                                hideFilteredRef.current = next;
+                                setHideFiltered(next);
+                                setVisibleCount(COMMENTS_PAGE_SIZE);
+                                void setHideFilteredComments(next);
+                                void refreshVisibleComments(COMMENTS_PAGE_SIZE);
+                              }}
+                            />
+                            <span className="switch-track" />
+                          </label>
+                          <p className="filter-count">
+                            {hideFiltered &&
+                            canFilter &&
+                            state.snapshot.filteredCount > 0
+                              ? `${state.snapshot.filteredCount.toLocaleString()} spam hidden`
+                              : ''}
+                          </p>
+                        </div>
                       </div>
                   </div>
                   {threadError && <p className="thread-error">{threadError}</p>}
 
-                  <div className="section-subactions">
-                    {canFilter && state.snapshot.filteredCount > 0 && (
-                      <span className="filter-note">
-                        {state.snapshot.filteredCount}{' '}
-                        {hideFiltered ? 'spam hidden' : 'flagged by YouTube'}
-                      </span>
-                    )}
-                    <button
-                      className="text-button"
-                      onClick={handleLoadAll}
-                      disabled={isBusy}
-                    >
-                      {isLoadingAll ? 'Loading…' : 'Load all'}
-                    </button>
-                    <button
-                      className="text-button"
-                      onClick={jumpToComments}
-                      disabled={isBusy}
-                    >
-                      Jump to page
-                    </button>
+                  <div className="comment-toolbar">
+                    <div className="toolbar-actions">
+                      <button
+                        type="button"
+                        className="toolbar-button"
+                        onClick={() => void exportComments('csv')}
+                        disabled={isLoadingAll || exportKind !== null}
+                        title="Download the loaded comments as a spreadsheet. Hide spam applies."
+                      >
+                        {exportKind === 'csv' ? 'Exporting…' : 'Export CSV'}
+                      </button>
+                      <button
+                        type="button"
+                        className="toolbar-button"
+                        onClick={() => void exportComments('pdf')}
+                        disabled={isLoadingAll || exportKind !== null}
+                        title="Download the loaded comments as a PDF. Hide spam applies."
+                      >
+                        {exportKind === 'pdf' ? 'Exporting…' : 'Export PDF'}
+                      </button>
+                      <button
+                        type="button"
+                        className="toolbar-button"
+                        onClick={handleLoadAll}
+                        disabled={isBusy}
+                      >
+                        {isLoadingAll ? 'Loading…' : 'Load all'}
+                      </button>
+                      <button
+                        type="button"
+                        className="toolbar-button"
+                        onClick={jumpToComments}
+                        disabled={isBusy}
+                      >
+                        Jump to page
+                      </button>
+                    </div>
                   </div>
 
                   <div className="comment-list" ref={listRef}>
+                    {visibleThreads.length === 0 && (
+                      <p className="comment-list-empty">
+                        YouTube is sending the thread in pages. Comments will
+                        appear here as they arrive.
+                      </p>
+                    )}
                     {visibleThreads.map((thread) => {
                       const expanded = expandedThreadIds.has(thread.parent.id);
                       const canShowReplies = thread.replies.length > 0;

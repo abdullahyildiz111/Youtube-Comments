@@ -269,13 +269,6 @@ main {
   text-transform: uppercase;
 }
 
-.count-note {
-  margin: 10px 0 0;
-  color: #8a8a92;
-  font-size: 10px;
-  line-height: 1.45;
-}
-
 .metric-divider {
   width: 1px;
   height: 31px;
@@ -789,6 +782,18 @@ main {
   background: #f7f7f8;
 }
 
+.comments-section .section-heading h2 {
+  min-width: 9.4em;
+}
+
+.comments-section .section-heading p {
+  max-width: 220px;
+  min-height: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .section-heading h2 {
   margin: 0;
   color: #28282c;
@@ -864,9 +869,9 @@ main {
 
 .threadline {
   position: relative;
-  display: flex;
-  flex-direction: row;
-  flex-shrink: 0;
+  display: block;
+  flex: 0 0 24px;
+  align-self: stretch;
   width: 24px;
 }
 
@@ -874,20 +879,25 @@ main {
 .thread-continuation {
   position: absolute;
   right: 0;
-  border-left: 1px solid #e5e5e5;
   box-sizing: border-box;
+  border-left: 1px solid #c8c8c8;
 }
 
 .thread-connection {
+  top: 0;
   width: 50%;
   height: 24px;
-  border-bottom: 1px solid #e5e5e5;
-  border-radius: 0 0 0 16px;
+  border-bottom: 1px solid #c8c8c8;
+  border-bottom-left-radius: 12px;
 }
 
+/* top and bottom stretch with the reply, including its own children.
+   A percentage height does not resolve here because the gutter's height
+   comes from the neighbouring comment, not from its own content. */
 .thread-continuation {
+  top: 0;
+  bottom: 0;
   width: 50%;
-  height: 100%;
 }
 
 /* The last reply on a level stops the line at its own elbow. */
@@ -897,7 +907,7 @@ main {
 
 .sub-thread:hover > .threadline .thread-connection,
 .sub-thread:hover > .threadline .thread-continuation {
-  border-color: #c9c9c9;
+  border-color: #9a9a9a;
 }
 
 .sub-thread-content {
@@ -1188,22 +1198,79 @@ footer {
   line-height: 18px;
 }
 
+.filter-control {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+}
+
 .filter-switch {
   font-size: 9px;
 }
 
-.section-subactions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 0 3px 8px;
+.filter-count {
+  min-height: 12px;
+  margin: 0;
+  color: #9a9aa1;
+  font-size: 9px;
+  font-weight: 650;
+  line-height: 12px;
+  letter-spacing: 0;
+  text-transform: none;
+  white-space: nowrap;
 }
 
-.filter-note {
-  margin-right: auto;
-  color: #9a9aa1;
+.comment-toolbar {
+  flex-shrink: 0;
+  box-sizing: border-box;
+  margin: 0 0 10px;
+  padding: 8px;
+  background: #ffffff;
+  border: 1px solid #e1e1e4;
+  border-radius: 14px;
+}
+
+.toolbar-actions {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.toolbar-button {
+  height: 32px;
+  min-width: 0;
+  padding: 0 2px;
+  overflow: hidden;
+  color: #1c1c1f;
+  background: #e8e8eb;
+  border: 1px solid #d8d8dc;
+  border-radius: 9px;
   font-size: 10px;
+  font-weight: 700;
+  line-height: 32px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.toolbar-button:hover:not(:disabled) {
+  color: #17171a;
+  background: #ffffff;
+  border-color: #d4d4d8;
+}
+
+.toolbar-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.comment-list-empty {
+  margin: 0;
+  padding: 28px 16px;
+  color: #8a8a93;
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: center;
 }
 
 .filter-switch.is-unavailable {
@@ -1218,6 +1285,7 @@ footer {
  * stay readable without losing the connector.
  */
 .sub-thread.is-tight > .threadline {
+  flex-basis: 12px;
   width: 12px;
 }
 
@@ -1226,6 +1294,7 @@ footer {
 }
 
 .sub-thread.is-flush > .threadline {
+  flex-basis: 8px;
   width: 8px;
 }
 
