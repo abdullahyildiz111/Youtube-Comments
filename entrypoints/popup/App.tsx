@@ -38,9 +38,82 @@ import {
   type ChatMessage,
 } from '@/lib/chat-cache';
 import { ChatPanel } from './ChatPanel';
+import { ResizeHandle } from './ResizeHandle';
+import {
+  OPEN_DETACHED_MESSAGE,
+  POPUP_RETARGET_MESSAGE,
+  isDetachedPopup,
+} from './popup-size';
 import './App.css';
 
 const COMMENTS_PAGE_SIZE = MAX_SNAPSHOT_COMMENTS;
+
+type PopupTarget = { windowId?: number; tabId?: number };
+
+function readPopupTarget(): PopupTarget {
+  const params = new URLSearchParams(location.search);
+  const windowId = Number(params.get('windowId'));
+  const tabId = Number(params.get('tabId'));
+  return {
+    windowId: Number.isInteger(windowId) && windowId > 0 ? windowId : undefined,
+    tabId: Number.isInteger(tabId) && tabId > 0 ? tabId : undefined,
+  };
+}
+
+function rememberPopupTarget(target: PopupTarget) {
+  const url = new URL(location.href);
+  url.searchParams.set('detached', '1');
+  if (target.windowId != null) url.searchParams.set('windowId', String(target.windowId));
+  else url.searchParams.delete('windowId');
+  if (target.tabId != null) url.searchParams.set('tabId', String(target.tabId));
+  else url.searchParams.delete('tabId');
+  history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
+}
+
+async function findVideoTab(target: PopupTarget) {
+  if (!isDetachedPopup()) {
+    const [tab] = await browser.tabs.query({
+      active: true,
+      currentWindow: true,
+    });
+    return tab;
+  }
+
+  if (target.windowId != null) {
+    const [active] = await browser.tabs.query({
+      active: true,
+      windowId: target.windowId,
+    });
+    if (active?.id) return active;
+  }
+
+  if (target.tabId != null) {
+    try {
+      return await browser.tabs.get(target.tabId);
+    } catch {
+      // That tab has been closed.
+    }
+  }
+
+  const windows = await browser.windows.getAll({
+    populate: true,
+    windowTypes: ['normal'],
+  });
+  const focused = windows.find((item) => item.focused) ?? windows[0];
+  return focused?.tabs?.find((item) => item.active);
+}
+
+async function openDetachedWindow() {
+  const [tab] = await browser.tabs.query({
+    active: true,
+    currentWindow: true,
+  });
+  await browser.runtime.sendMessage({
+    type: OPEN_DETACHED_MESSAGE,
+    windowId: tab?.windowId,
+    tabId: tab?.id,
+  });
+}
 
 type PopupState =
   | { kind: 'loading' }
@@ -58,6 +131,14 @@ function RefreshIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="M19.7 7.3A9 9 0 1 0 21 12h-2a7 7 0 1 1-2.05-4.95L14 10h7V3l-1.3 1.3v3Z" />
+    </svg>
+  );
+}
+
+function WindowIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M14 3h7v7h-2V6.41l-5.3 5.3-1.4-1.42L17.59 5H14V3ZM5 5h6v2H7v10h10v-4h2v6H5V5Z" />
     </svg>
   );
 }
@@ -367,21 +448,15 @@ function App() {
     state.kind === 'ready' ? state.snapshot.videoId : null;
   const activeVideoIdRef = useRef(activeVideoId);
   activeVideoIdRef.current = activeVideoId;
+  const targetRef = useRef(readPopupTarget());
 
   const loadSnapshot = useCallback(async (silent = false) => {
     if (!silent) setIsRefreshing(true);
 
     try {
-      const [tab] = await browser.tabs.query({
-        active: true,
-        currentWindow: true,
-      });
+      const tab = await findVideoTab(targetRef.current);
 
-      if (
-        !tab?.id ||
-        !tab.url ||
-        getYouTubeVideoId(tab.url) === null
-      ) {
+      if (!tab?.id || (tab.url != null && getYouTubeVideoId(tab.url) === null)) {
         setState({ kind: 'unsupported' });
         return;
       }
@@ -416,6 +491,21 @@ function App() {
 
     const handleMessage = (message: unknown) => {
       if (!message || typeof message !== 'object' || !('type' in message)) {
+        return;
+      }
+
+      if (
+        (message as { type?: string }).type === POPUP_RETARGET_MESSAGE &&
+        isDetachedPopup()
+      ) {
+        const next = message as { windowId?: unknown; tabId?: unknown };
+        const target: PopupTarget = {
+          windowId: typeof next.windowId === 'number' ? next.windowId : undefined,
+          tabId: typeof next.tabId === 'number' ? next.tabId : undefined,
+        };
+        targetRef.current = target;
+        rememberPopupTarget(target);
+        void loadSnapshot(true);
         return;
       }
 
@@ -996,6 +1086,17 @@ function App() {
           />
           <span className="switch-track" />
         </label>
+        {!isDetachedPopup() && (
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Open in a window"
+            title="Open in a resizable window"
+            onClick={() => void openDetachedWindow()}
+          >
+            <WindowIcon />
+          </button>
+        )}
         <button
           className="icon-button"
           aria-label="Refresh captured comments"
@@ -1353,6 +1454,7 @@ function App() {
         <span className="footer-dot">•</span>
         <span>Ask the comments anything</span>
       </footer>
+      <ResizeHandle />
     </div>
   );
 }
