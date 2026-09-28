@@ -34,6 +34,7 @@ export default defineBackground(() => {
         request.comments,
         request.videoId,
         request.videoTitle,
+        request.language,
       )
         .then((summary) => {
           sendResponse({ ok: true, summary });
@@ -52,6 +53,7 @@ export default defineBackground(() => {
         request.videoTitle,
         request.question,
         request.history,
+        request.language,
       )
         .then((answer) => {
           sendResponse({ ok: true, answer });

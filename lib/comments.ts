@@ -138,11 +138,15 @@ export type CollectorRequest =
     }
   | { type: typeof COMMENT_MESSAGES.scrollToComments }
   | { type: typeof COMMENT_MESSAGES.loadAllComments }
-  | { type: typeof COMMENT_MESSAGES.summarizeLoaded }
+  | {
+      type: typeof COMMENT_MESSAGES.summarizeLoaded;
+      language?: string;
+    }
   | {
       type: typeof COMMENT_MESSAGES.chatAboutComments;
       question: string;
       history: Array<{ role: 'user' | 'assistant'; text: string }>;
+      language?: string;
     };
 
 export interface CommentsPageResponse {

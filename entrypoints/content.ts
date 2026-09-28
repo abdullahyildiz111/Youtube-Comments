@@ -37,13 +37,19 @@ import {
   summarizeCommentsInCloud,
   askCommentsInCloud,
 } from '@/lib/cloud-summarizer';
+import { isReplyLanguageCode } from '@/lib/languages';
 import {
   AUTO_SUMMARIZE_KEY,
   HIDE_FILTERED_KEY,
   getAutoSummarizeEnabled,
   getHideFilteredComments,
+  getReplyLanguage,
 } from '@/lib/settings';
-import { readSummaryCache, saveSummary } from '@/lib/summary-cache';
+import {
+  readSummaryCache,
+  saveSummary,
+  summaryCacheKey,
+} from '@/lib/summary-cache';
 
 const COMMENT_RENDERER_SELECTOR = [
   'ytd-comment-thread-renderer ytd-comment-view-model',
@@ -871,7 +877,9 @@ export default defineContentScript({
       });
     };
 
-    const summarizeLoadedComments = async (): Promise<SummarizeLoadedResponse> => {
+    const summarizeLoadedComments = async (
+      language?: string,
+    ): Promise<SummarizeLoadedResponse> => {
       if (!activeVideoId || comments.size === 0) {
         return {
           ok: false,
@@ -879,11 +887,16 @@ export default defineContentScript({
         };
       }
 
+      const replyLanguage = isReplyLanguageCode(language)
+        ? language
+        : await getReplyLanguage();
+
       try {
         const result = await summarizeCommentsInCloud(
           listedComments(),
           activeVideoId,
           videoTitle,
+          replyLanguage,
         );
         const summary = {
           videoId: activeVideoId,
@@ -891,6 +904,7 @@ export default defineContentScript({
           commentCount: result.commentCount,
           generatedAt: new Date().toISOString(),
           model: result.model,
+          language: replyLanguage,
         };
         await saveSummary(summary);
         publishSummary(summary);
@@ -906,6 +920,7 @@ export default defineContentScript({
     const chatAboutLoadedComments = async (
       question: string,
       history: Array<{ role: 'user' | 'assistant'; text: string }>,
+      language?: string,
     ): Promise<ChatAboutCommentsResponse> => {
       if (!activeVideoId || comments.size === 0) {
         return {
@@ -915,12 +930,16 @@ export default defineContentScript({
       }
 
       try {
+        const replyLanguage = isReplyLanguageCode(language)
+          ? language
+          : await getReplyLanguage();
         const result = await askCommentsInCloud(
           listedComments(),
           activeVideoId,
           videoTitle,
           question,
           history,
+          replyLanguage,
         );
         return { ok: true, answer: result.text };
       } catch (error: unknown) {
@@ -941,7 +960,10 @@ export default defineContentScript({
       if (!autoEnabled || !activeVideoId) return;
 
       const videoId = activeVideoId;
-      const cached = (await readSummaryCache())[videoId];
+      const replyLanguage = await getReplyLanguage();
+      const cached = (await readSummaryCache())[
+        summaryCacheKey(videoId, replyLanguage)
+      ];
       if (runId !== autoRunId || !autoEnabled || activeVideoId !== videoId) return;
 
       setAutoPhase('fetching');
@@ -1082,11 +1104,15 @@ export default defineContentScript({
       }
 
       if (request.type === COMMENT_MESSAGES.summarizeLoaded) {
-        return summarizeLoadedComments();
+        return summarizeLoadedComments(request.language);
       }
 
       if (request.type === COMMENT_MESSAGES.chatAboutComments) {
-        return chatAboutLoadedComments(request.question, request.history);
+        return chatAboutLoadedComments(
+          request.question,
+          request.history,
+          request.language,
+        );
       }
 
       return undefined;

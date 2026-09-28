@@ -1,7 +1,7 @@
 import type { YouTubeComment } from '@/lib/comments';
 
 const LOCAL_API_ORIGIN = 'http://localhost:3000';
-const REQUEST_TIMEOUT_MS = 180_000;
+const REQUEST_TIMEOUT_MS = 480_000;
 
 export const SUMMARIZE_MESSAGE = 'comment-catcher:summarize' as const;
 export const CHAT_MESSAGE = 'comment-catcher:chat' as const;
@@ -23,6 +23,7 @@ export interface SummarizeRequest {
   type: typeof SUMMARIZE_MESSAGE;
   videoId: string;
   videoTitle: string;
+  language: string;
   comments: Array<{ text: string; isReply: boolean }>;
 }
 
@@ -35,6 +36,7 @@ export interface ChatRequest {
   type: typeof CHAT_MESSAGE;
   videoId: string;
   videoTitle: string;
+  language: string;
   question: string;
   history: ChatTurn[];
   comments: Array<{ text: string; isReply: boolean }>;
@@ -110,6 +112,7 @@ export async function performSummaryFetch(
   comments: Array<{ text: string; isReply: boolean }>,
   videoId: string,
   videoTitle: string,
+  language: string,
 ): Promise<CloudSummary> {
   if (comments.length === 0) {
     throw new Error('There are no captured comments to summarize.');
@@ -128,6 +131,7 @@ export async function performSummaryFetch(
       body: JSON.stringify({
         videoId,
         videoTitle,
+        language,
         comments,
       }),
       signal: controller.signal,
@@ -169,11 +173,13 @@ export async function summarizeCommentsInCloud(
   comments: YouTubeComment[],
   videoId: string,
   videoTitle: string,
+  language: string,
 ): Promise<CloudSummary> {
   const request: SummarizeRequest = {
     type: SUMMARIZE_MESSAGE,
     videoId,
     videoTitle,
+    language,
     comments: comments.map((comment) => ({
       text: comment.text,
       isReply: comment.isReply,
@@ -228,6 +234,7 @@ export async function performChatFetch(
   videoTitle: string,
   question: string,
   history: ChatTurn[],
+  language: string,
 ): Promise<CloudChatAnswer> {
   if (comments.length === 0) {
     throw new Error('There are no captured comments to ask about.');
@@ -246,6 +253,7 @@ export async function performChatFetch(
       body: JSON.stringify({
         videoId,
         videoTitle,
+        language,
         question,
         history,
         comments,
@@ -291,11 +299,13 @@ export async function askCommentsInCloud(
   videoTitle: string,
   question: string,
   history: ChatTurn[],
+  language: string,
 ): Promise<CloudChatAnswer> {
   const request: ChatRequest = {
     type: CHAT_MESSAGE,
     videoId,
     videoTitle,
+    language,
     question,
     history,
     comments: comments.map((comment) => ({

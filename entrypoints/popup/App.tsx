@@ -28,15 +28,20 @@ import {
   type CommentThread,
   type YouTubeComment,
 } from '@/lib/comments';
+import { languageLabel, REPLY_LANGUAGES } from '@/lib/languages';
 import {
   AUTO_SUMMARIZE_KEY,
+  DEFAULT_REPLY_LANGUAGE,
   HIDE_FILTERED_KEY,
+  getReplyLanguage,
   setAutoSummarizeEnabled,
   setHideFilteredComments,
+  setReplyLanguage as storeReplyLanguage,
 } from '@/lib/settings';
 import {
   SUMMARY_CACHE_KEY,
   readSummaryCache,
+  summaryCacheKey,
   type SavedSummary,
 } from '@/lib/summary-cache';
 import {
@@ -147,6 +152,14 @@ function WindowIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="M14 3h7v7h-2V6.41l-5.3 5.3-1.4-1.42L17.59 5H14V3ZM5 5h6v2H7v10h10v-4h2v6H5V5Z" />
+    </svg>
+  );
+}
+
+function EarthIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 2a10 10 0 1 0 .01 20.01A10 10 0 0 0 12 2Zm-1 17.93C7.05 19.44 4 16.08 4 12c0-.62.08-1.21.21-1.79L9 15v1a2 2 0 0 0 2 2v1.93Zm6.9-2.54A2.01 2.01 0 0 0 17 16h-1v-3a1 1 0 0 0-1-1H8v-2h2a1 1 0 0 0 1-1V7h2a2 2 0 0 0 2-2v-.41A8 8 0 0 1 20 12a7.96 7.96 0 0 1-2.1 5.39Z" />
     </svg>
   );
 }
@@ -453,6 +466,11 @@ function App() {
   const [hideFiltered, setHideFiltered] = useState(false);
   const hideFilteredRef = useRef(hideFiltered);
   hideFilteredRef.current = hideFiltered;
+  const [replyLanguage, setReplyLanguage] = useState(DEFAULT_REPLY_LANGUAGE);
+  const [languageOpen, setLanguageOpen] = useState(false);
+  const languageAnchorRef = useRef<HTMLDivElement>(null);
+  const replyLanguageRef = useRef(replyLanguage);
+  replyLanguageRef.current = replyLanguage;
   const activeVideoId =
     state.kind === 'ready' ? state.snapshot.videoId : null;
   const activeVideoIdRef = useRef(activeVideoId);
@@ -492,9 +510,13 @@ function App() {
         setAutoSummarize(stored[AUTO_SUMMARIZE_KEY] === true);
         setHideFiltered(stored[HIDE_FILTERED_KEY] === true);
       });
+    void getReplyLanguage().then((language) => {
+      setReplyLanguage(language);
+    });
 
     const applySummary = (summary: SavedSummary | undefined) => {
       if (!summary || summary.videoId !== activeVideoIdRef.current) return;
+      if (summary.language !== replyLanguageRef.current) return;
       setSummaryState({ kind: 'success', value: summary });
     };
 
@@ -548,7 +570,11 @@ function App() {
         if (!cache || typeof cache !== 'object') return;
         const videoId = activeVideoIdRef.current;
         if (!videoId) return;
-        applySummary((cache as Record<string, SavedSummary>)[videoId]);
+        applySummary(
+          (cache as Record<string, SavedSummary>)[
+            summaryCacheKey(videoId, replyLanguageRef.current)
+          ],
+        );
       }
     };
 
@@ -561,6 +587,32 @@ function App() {
   }, [loadSnapshot]);
 
   useEffect(() => {
+    if (!languageOpen) return;
+
+    languageAnchorRef.current
+      ?.querySelector<HTMLButtonElement>('.language-menu .is-selected')
+      ?.scrollIntoView({ block: 'nearest' });
+
+    const close = (event: MouseEvent) => {
+      const anchor = languageAnchorRef.current;
+      if (anchor && event.target instanceof Node && anchor.contains(event.target)) {
+        return;
+      }
+      setLanguageOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setLanguageOpen(false);
+    };
+
+    document.addEventListener('mousedown', close);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', close);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [languageOpen]);
+
+  useEffect(() => {
     const runId = ++summaryRunId.current;
     setSummaryState({ kind: 'idle' });
     setThreadError(null);
@@ -569,15 +621,19 @@ function App() {
 
     void readSummaryCache()
       .then((cache) => {
-        const cachedSummary = cache[activeVideoId];
-        if (cachedSummary && summaryRunId.current === runId) {
+        const cachedSummary =
+          cache[summaryCacheKey(activeVideoId, replyLanguage)];
+        if (
+          cachedSummary?.language === replyLanguage &&
+          summaryRunId.current === runId
+        ) {
           setSummaryState({ kind: 'success', value: cachedSummary });
         }
       })
       .catch(() => {
         // A failed cache read should not block a new summary.
       });
-  }, [activeVideoId]);
+  }, [activeVideoId, replyLanguage]);
 
   useEffect(() => {
     setSortOrder(DEFAULT_COMMENT_SORT_ORDER);
@@ -651,8 +707,9 @@ function App() {
     ) {
       void readSummaryCache().then((cache) => {
         if (summaryInFlightRef.current) return;
-        const cachedSummary = cache[videoId];
-        if (cachedSummary) {
+        const cachedSummary =
+          cache[summaryCacheKey(videoId, replyLanguageRef.current)];
+        if (cachedSummary?.language === replyLanguageRef.current) {
           setSummaryState({ kind: 'success', value: cachedSummary });
         }
       });
@@ -715,12 +772,15 @@ function App() {
     void browser.tabs
       .sendMessage(state.tabId, {
         type: COMMENT_MESSAGES.summarizeLoaded,
+        language: replyLanguageRef.current,
       })
       .then((response) => {
         if (summaryRunId.current !== runId) return;
         const result = response as SummarizeLoadedResponse;
         if (result?.ok && result.summary) {
-          setSummaryState({ kind: 'success', value: result.summary });
+          if (result.summary.language === replyLanguageRef.current) {
+            setSummaryState({ kind: 'success', value: result.summary });
+          }
           return;
         }
 
@@ -919,6 +979,7 @@ function App() {
         type: COMMENT_MESSAGES.chatAboutComments,
         question,
         history: chatMessages.map(({ role, text }) => ({ role, text })),
+        language: replyLanguageRef.current,
       })) as ChatAboutCommentsResponse;
 
       if (!response?.ok || !response.answer) {
@@ -1137,6 +1198,40 @@ function App() {
           <span>YOUTUBE TOOL</span>
           <h1>Comment Catcher</h1>
         </div>
+        <div className="language-anchor" ref={languageAnchorRef}>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label={`Summary and chat language, ${languageLabel(replyLanguage)}`}
+            aria-expanded={languageOpen}
+            aria-haspopup="listbox"
+            title={languageLabel(replyLanguage)}
+            onClick={() => setLanguageOpen((open) => !open)}
+          >
+            <EarthIcon />
+          </button>
+          {languageOpen && (
+            <ul className="language-menu" role="listbox" aria-label="Summary and chat language">
+              {REPLY_LANGUAGES.map((language) => (
+                <li key={language.code}>
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={language.code === replyLanguage}
+                    className={language.code === replyLanguage ? 'is-selected' : undefined}
+                    onClick={() => {
+                      setReplyLanguage(language.code);
+                      void storeReplyLanguage(language.code);
+                      setLanguageOpen(false);
+                    }}
+                  >
+                    {language.label}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
         <label
           className="auto-switch"
           title="Fetch and summarize comments when a video opens"
@@ -1326,6 +1421,8 @@ function App() {
                       <div className="summary-result-footer">
                         <span>
                           Based on {summaryState.value.commentCount} comments
+                          {summaryState.value.language &&
+                            ` • ${languageLabel(summaryState.value.language)}`}
                           {summaryState.value.model &&
                             ` • ${summaryState.value.model}`}
                           {summaryState.value.commentCount !==
@@ -1360,6 +1457,7 @@ function App() {
                         ? 'Wait until comments finish loading or summarizing.'
                         : ''
                   }
+                  languageLabel={languageLabel(replyLanguage)}
                   sending={chatSending}
                   error={chatError}
                   messages={chatMessages}

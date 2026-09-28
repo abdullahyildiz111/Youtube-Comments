@@ -10,6 +10,7 @@ const SUGGESTIONS = [
 interface ChatPanelProps {
   disabled: boolean;
   disabledReason: string;
+  languageLabel: string;
   sending: boolean;
   error: string | null;
   messages: ChatMessage[];
@@ -20,6 +21,7 @@ interface ChatPanelProps {
 export function ChatPanel({
   disabled,
   disabledReason,
+  languageLabel,
   sending,
   error,
   messages,
@@ -47,7 +49,7 @@ export function ChatPanel({
       <div className="section-heading">
         <div>
           <h2>Ask the comments</h2>
-          <p>Questions use the comments already loaded</p>
+          <p>Answers are in {languageLabel}</p>
         </div>
         {messages.length > 0 && (
           <button
