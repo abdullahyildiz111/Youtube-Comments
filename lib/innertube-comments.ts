@@ -972,6 +972,24 @@ function walkedCommentId(
   return key ? byKey.get(key) ?? '' : '';
 }
 
+function replyButtonCount(replies: Record<string, unknown>): string | null {
+  const button =
+    asRecord(asRecord(replies.viewReplies)?.buttonRenderer) ??
+    asRecord(replies.viewReplies);
+  const label = asRecord(asRecord(button?.accessibility)?.accessibilityData)?.label;
+  const text =
+    runsToText(button?.text) ||
+    runsToText(button?.title) ||
+    runsToText(label) ||
+    readString(label) ||
+    runsToText(replies.viewReplies);
+  const match = text.replace(/\s+/g, ' ').trim().match(/^(\d[\d.,]*)\s*([KMB])?(?:\s|$)/i);
+  if (!match?.[1]) return null;
+  if (match[2]) return `${match[1].replace(/[^\d]/g, '')}${match[2].toUpperCase()}`;
+  const digits = match[1].replace(/[^\d]/g, '');
+  return digits ? String(Number(digits)) : null;
+}
+
 function repliesRendererOf(
   record: Record<string, unknown>,
 ): Record<string, unknown> | null {
@@ -1000,6 +1018,7 @@ function walkCommentItems(
   replyTokens: QueuedToken[],
   comments: Map<string, YouTubeComment>,
   seen: Set<string>,
+  replyButtonCounts: Map<string, string>,
   depth = 0,
 ): void {
   if (depth > 30) return;
@@ -1019,6 +1038,7 @@ function walkCommentItems(
           replyTokens,
           comments,
           seen,
+          replyButtonCounts,
           depth + 1,
         );
       }
@@ -1059,9 +1079,13 @@ function walkCommentItems(
         replyTokens,
         comments,
         seen,
+        replyButtonCounts,
         depth + 1,
       );
     }
+
+    const buttonCount = replyButtonCount(replies);
+    if (buttonCount) replyButtonCounts.set(ownerId, buttonCount);
 
     const viewToken = continuationFrom(replies.viewReplies);
     if (viewToken) {
@@ -1098,6 +1122,7 @@ function parseNextResponse(
   totalCommentsLabel: string | null;
   orderedRootIds: string[];
   orderedReplyIds: string[];
+  replyButtonCounts: Map<string, string>;
 } {
   const comments = new Map<string, YouTubeComment>(
     parseEntities(data, isReply, parentId),
@@ -1106,6 +1131,7 @@ function parseNextResponse(
   const replyTokens: QueuedToken[] = [];
   const orderedRootIds: string[] = [];
   const orderedReplyIds: string[] = [];
+  const replyButtonCounts = new Map<string, string>();
   const pinnedLabels = new Map<string, string>();
   const walked: WalkedComment[] = [];
   const seenWalked = new Set<string>();
@@ -1133,6 +1159,7 @@ function parseNextResponse(
       replyTokens,
       comments,
       seenWalked,
+      replyButtonCounts,
     );
     const seenRoot = new Set(orderedRootIds);
     const seenReply = new Set(orderedReplyIds);
@@ -1199,6 +1226,7 @@ function parseNextResponse(
     totalCommentsLabel,
     orderedRootIds,
     orderedReplyIds,
+    replyButtonCounts,
   };
 }
 
@@ -1543,9 +1571,16 @@ export async function fetchAllVideoComments(
       if (next.sort === 'top') {
         for (const comment of parsed.comments) {
           featuredIds.add(comment.id);
-          if (!comment.isReply && comment.replyCount) {
+          if (
+            !comment.isReply &&
+            comment.replyCount &&
+            !parsed.replyButtonCounts.has(comment.id)
+          ) {
             featuredReplyCounts.set(comment.id, comment.replyCount);
           }
+        }
+        for (const [id, count] of parsed.replyButtonCounts) {
+          featuredReplyCounts.set(id, count);
         }
       }
 

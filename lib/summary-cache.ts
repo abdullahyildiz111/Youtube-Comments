@@ -14,6 +14,19 @@ export function summaryCacheKey(videoId: string, language: string): string {
   return `${videoId}:${language}`;
 }
 
+export function findCachedSummary(
+  cache: Record<string, SavedSummary>,
+  videoId: string,
+  language: string,
+): SavedSummary | undefined {
+  const keyed = cache[summaryCacheKey(videoId, language)];
+  if (keyed?.videoId === videoId && keyed.language === language) return keyed;
+
+  return Object.values(cache).find(
+    (entry) => entry.videoId === videoId && entry.language === language,
+  );
+}
+
 export async function readSummaryCache(): Promise<Record<string, SavedSummary>> {
   const stored = await browser.storage.local.get(SUMMARY_CACHE_KEY);
   const cache = stored[SUMMARY_CACHE_KEY];
@@ -37,7 +50,12 @@ export async function saveSummary(summary: SavedSummary): Promise<void> {
           Date.parse(second.generatedAt) - Date.parse(first.generatedAt),
       )
       .slice(0, MAX_CACHED_SUMMARIES)
-      .map((entry) => [entry.videoId, entry]),
+      .map((entry) => [
+        entry.language
+          ? summaryCacheKey(entry.videoId, entry.language)
+          : entry.videoId,
+        entry,
+      ]),
   );
 
   await browser.storage.local.set({

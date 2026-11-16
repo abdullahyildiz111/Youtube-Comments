@@ -57,9 +57,12 @@ button {
     opacity 140ms ease;
 }
 
-button:focus,
+button:focus {
+  outline: none;
+}
+
 button:focus-visible {
-  outline: 2px solid #ff5f5f;
+  outline: 2px solid #8b6adf;
   outline-offset: 2px;
 }
 

@@ -166,6 +166,28 @@ export default defineContentScript({
     publishReady();
     syncListedCount();
 
+    let hiddenAt = 0;
+    const wakeBridge = (cancelLoad: boolean) => {
+      if (document.visibilityState === 'hidden') return;
+      if (cancelLoad) {
+        activeRequestId = '';
+        lastCountVideoId = '';
+      }
+      publishReady();
+      syncListedCount();
+    };
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        hiddenAt = Date.now();
+        return;
+      }
+      wakeBridge(hiddenAt > 0 && Date.now() - hiddenAt >= 20_000);
+      hiddenAt = 0;
+    });
+    document.addEventListener('resume', () => wakeBridge(true));
+    window.addEventListener('pageshow', () => wakeBridge(true));
+
     document.addEventListener('yt-navigate-finish', () => {
       lastCountVideoId = '';
       syncListedCount();

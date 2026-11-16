@@ -46,6 +46,8 @@ export const COMMENT_MESSAGES = {
   summaryReady: 'youtube-comments:summary-ready',
   summarizeLoaded: 'youtube-comments:summarize-loaded',
   chatAboutComments: 'youtube-comments:chat',
+  wake: 'youtube-comments:wake',
+  searchComments: 'youtube-comments:search',
 } as const;
 
 export type AutoSummarizePhase = 'off' | 'idle' | 'fetching' | 'summarizing';
@@ -138,6 +140,15 @@ export type CollectorRequest =
     }
   | { type: typeof COMMENT_MESSAGES.scrollToComments }
   | { type: typeof COMMENT_MESSAGES.loadAllComments }
+  | { type: typeof COMMENT_MESSAGES.wake }
+  | {
+      type: typeof COMMENT_MESSAGES.searchComments;
+      query: string;
+      offset: number;
+      limit?: number;
+      sortOrder?: CommentSortOrder;
+      hideFilteredComments?: boolean;
+    }
   | {
       type: typeof COMMENT_MESSAGES.summarizeLoaded;
       language?: string;
@@ -156,6 +167,15 @@ export interface CommentsPageResponse {
   total: number;
   sortOrder: CommentSortOrder;
   hideFilteredComments: boolean;
+}
+
+export interface SearchCommentsResponse {
+  videoId: string | null;
+  query: string;
+  offset: number;
+  matchCount: number;
+  comments: YouTubeComment[];
+  total: number;
 }
 
 export interface LoadAllCommentsResponse {

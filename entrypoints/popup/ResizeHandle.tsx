@@ -1,4 +1,5 @@
 import { useRef } from 'react';
+import { useUiText } from '@/lib/ui-text';
 import type { KeyboardEvent, PointerEvent } from 'react';
 import {
   POPUP_DEFAULT_SIZE,
@@ -36,6 +37,7 @@ function resizeCursor(anchor: PopupAnchor): 'nwse' | 'nesw' {
 }
 
 export function ResizeHandle() {
+  const { copy } = useUiText();
   const detached = isDetachedPopup();
   const dragRef = useRef<DragState | null>(null);
   const pendingSize = useRef<PopupSize | null>(null);
@@ -190,8 +192,8 @@ export function ResizeHandle() {
     <button
       type="button"
       className={corner}
-      aria-label="Resize popup"
-      title="Drag to resize"
+      aria-label={copy.resize}
+      title={copy.resizeTitle}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={finishDrag}

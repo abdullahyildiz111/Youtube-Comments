@@ -6,6 +6,7 @@ import {
   type ChatRequest,
   type SummarizeRequest,
 } from '@/lib/cloud-summarizer';
+import { COMMENT_MESSAGES } from '@/lib/comments';
 import {
   OPEN_DETACHED_MESSAGE,
   POPUP_RETARGET_MESSAGE,
@@ -14,6 +15,14 @@ import {
 } from '@/entrypoints/popup/popup-size';
 
 export default defineBackground(() => {
+  browser.tabs.onActivated.addListener((info) => {
+    void browser.tabs
+      .sendMessage(info.tabId, { type: COMMENT_MESSAGES.wake })
+      .catch(() => {
+        // A discarded tab reloads on its own and starts the collector again.
+      });
+  });
+
   browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!message || typeof message !== 'object' || !('type' in message)) {
       return undefined;

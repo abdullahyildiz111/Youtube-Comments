@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactElement, type RefObject } from 'react';
 import {
   commentExportFileName,
   commentsToCsv,
@@ -18,8 +18,8 @@ import {
   type LoadAllCommentsResponse,
   type SummaryReadyMessage,
   type ScrollToCommentsResponse,
+  type SearchCommentsResponse,
   type SummarizeLoadedResponse,
-  COMMENT_SORT_OPTIONS,
   DEFAULT_COMMENT_SORT_ORDER,
   getYouTubeVideoId,
   groupCommentsForDisplay,
@@ -41,7 +41,7 @@ import {
 import {
   SUMMARY_CACHE_KEY,
   readSummaryCache,
-  summaryCacheKey,
+  findCachedSummary,
   type SavedSummary,
 } from '@/lib/summary-cache';
 import {
@@ -50,6 +50,14 @@ import {
   saveVideoChat,
   type ChatMessage,
 } from '@/lib/chat-cache';
+import {
+  fill,
+  languageName,
+  localizeMessage,
+  UiTextProvider,
+  useUiText,
+  uiText,
+} from '@/lib/ui-text';
 import { ChatPanel } from './ChatPanel';
 import { ResizeHandle } from './ResizeHandle';
 import {
@@ -136,7 +144,12 @@ type PopupState =
 
 type SummaryState =
   | { kind: 'idle' }
-  | { kind: 'working'; message: string }
+  | {
+      kind: 'working';
+      message: string;
+      phase?: 'fetching' | 'sending' | 'loading-all';
+      previous?: SavedSummary;
+    }
   | { kind: 'success'; value: SavedSummary }
   | { kind: 'error'; message: string };
 
@@ -189,6 +202,7 @@ function CommentSortMenu({
   onChange: (next: CommentSortOrder) => void;
   disabled: boolean;
 }) {
+  const { copy } = useUiText();
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -221,18 +235,21 @@ function CommentSortMenu({
         className="sort-trigger"
         aria-haspopup="listbox"
         aria-expanded={open}
-        aria-label="Sort comments"
-        title="Sort comments"
+        aria-label={copy.sortComments}
+        title={copy.sortComments}
         disabled={disabled}
         onClick={() => setOpen((current) => !current)}
       >
         <SortIcon />
-        <span>Sort by</span>
+        <span>{copy.sortBy}</span>
       </button>
 
       {open && (
-        <div className="sort-options" role="listbox" aria-label="Sort comments">
-          {COMMENT_SORT_OPTIONS.map((option) => (
+        <div className="sort-options" role="listbox" aria-label={copy.sortComments}>
+          {([
+            { value: 'top' as const, label: copy.sortTop, description: copy.sortTopHint },
+            { value: 'newest' as const, label: copy.sortNewest, description: copy.sortNewestHint },
+          ]).map((option) => (
             <button
               key={option.value}
               type="button"
@@ -262,20 +279,23 @@ function SparklesIcon() {
   );
 }
 
-function statusLabel(status: CommentsSnapshot['status']): string {
+function statusLabel(
+  status: CommentsSnapshot['status'],
+  copy: ReturnType<typeof uiText>,
+): string {
   switch (status) {
     case 'ready':
-      return 'Collecting live';
+      return copy.collectingLive;
     case 'loading-all':
-      return 'Loading all comments';
+      return copy.loadingAllStatus;
     case 'loading':
-      return 'YouTube is loading';
+      return copy.youtubeLoading;
     case 'no-comments':
-      return 'No comments found';
+      return copy.noCommentsFound;
     case 'waiting-for-comments':
-      return 'Waiting for comments';
+      return copy.waitingForComments;
     default:
-      return 'Open a video';
+      return copy.openAVideo;
   }
 }
 
@@ -292,14 +312,10 @@ function listedThreadCount(
     : groupCommentsForDisplay(snapshot.comments, order).length;
 }
 
-function repliesLabel(thread: CommentThread): string {
+function repliesLabel(thread: CommentThread, copy: ReturnType<typeof uiText>): string {
   const listed = thread.parent.replyCount;
-  if (listed && listed !== '0') {
-    return listed === '1' ? '1 reply' : `${listed} replies`;
-  }
-  return thread.replies.length === 1
-    ? '1 reply'
-    : `${thread.replies.length} replies`;
+  const count = listed && listed !== '0' ? listed : String(thread.replies.length);
+  return count === '1' ? copy.oneReply : fill(copy.manyReplies, { count });
 }
 
 function PinIcon() {
@@ -334,7 +350,42 @@ function ThumbUpIcon() {
   );
 }
 
-function CommentCard({ comment }: { comment: YouTubeComment }) {
+function highlightMatch(text: string, query: string) {
+  const needle = query.trim();
+  if (!needle) return text;
+  const hay = text.toLocaleLowerCase();
+  const look = needle.toLocaleLowerCase();
+  if (!look) return text;
+
+  const parts: Array<string | ReactElement> = [];
+  let cursor = 0;
+  let index = hay.indexOf(look);
+  let key = 0;
+  while (index !== -1) {
+    if (index > cursor) parts.push(text.slice(cursor, index));
+    const end = index + look.length;
+    parts.push(
+      <mark key={key} className="search-hit">
+        {text.slice(index, end)}
+      </mark>,
+    );
+    key += 1;
+    cursor = end;
+    index = hay.indexOf(look, cursor);
+  }
+  if (parts.length === 0) return text;
+  if (cursor < text.length) parts.push(text.slice(cursor));
+  return parts;
+}
+
+function CommentCard({
+  comment,
+  query = '',
+}: {
+  comment: YouTubeComment;
+  query?: string;
+}) {
+  const { copy } = useUiText();
   return (
     <article
       className={`comment-card${comment.isReply ? ' is-reply' : ''}`}
@@ -350,28 +401,28 @@ function CommentCard({ comment }: { comment: YouTubeComment }) {
         {comment.isPinned && (
           <div className="pinned-row">
             <PinIcon />
-            <span>{comment.pinnedLabel || 'Pinned'}</span>
+            <span>{comment.pinnedLabel || copy.pinned}</span>
           </div>
         )}
         <div className="comment-meta">
           <strong className={comment.isChannelOwner ? 'is-owner' : undefined}>
-            {comment.author}
+            {highlightMatch(comment.author, query)}
           </strong>
           {comment.isVerified && (
-            <span className="verified" title="Verified">
+            <span className="verified" title={copy.verified}>
               <VerifiedIcon />
             </span>
           )}
           {comment.publishedAt && <span>{comment.publishedAt}</span>}
         </div>
-        <p>{comment.text}</p>
+        <p>{highlightMatch(comment.text, query)}</p>
         <div className="comment-stats">
           <span className="stat-likes">
             <ThumbUpIcon />
             {comment.likeCount ?? '0'}
           </span>
           {comment.isCreatorHearted && (
-            <span className="stat-heart" title="Loved by the creator">
+            <span className="stat-heart" title={copy.lovedByCreator}>
               <HeartIcon />
             </span>
           )}
@@ -386,9 +437,11 @@ function CommentCard({ comment }: { comment: YouTubeComment }) {
 function ReplyBranch({
   nodes,
   depth,
+  query = '',
 }: {
   nodes: CommentNode[];
   depth: number;
+  query?: string;
 }) {
   return (
     <>
@@ -410,9 +463,9 @@ function ReplyBranch({
             <span className="thread-continuation" />
           </div>
           <div className="sub-thread-content">
-            <CommentCard comment={node.comment} />
+            <CommentCard comment={node.comment} query={query} />
             {node.children.length > 0 && (
-              <ReplyBranch nodes={node.children} depth={depth + 1} />
+              <ReplyBranch nodes={node.children} depth={depth + 1} query={query} />
             )}
           </div>
         </div>
@@ -421,13 +474,408 @@ function ReplyBranch({
   );
 }
 
-function formatCapturedAt(value: string | null): string | null {
+const CommentThreadList = memo(function CommentThreadList({
+  threads,
+  query,
+  expandedThreadIds,
+  emptyLabel,
+  onToggle,
+  canLoadMore,
+  sentinelRef,
+}: {
+  threads: CommentThread[];
+  query: string;
+  expandedThreadIds: Set<string>;
+  emptyLabel: string;
+  onToggle: (id: string) => void;
+  canLoadMore: boolean;
+  sentinelRef: RefObject<HTMLDivElement | null>;
+}) {
+  const { copy } = useUiText();
+  return (
+    <>
+      {threads.length === 0 && <p className="comment-list-empty">{emptyLabel}</p>}
+      {threads.map((thread) => {
+        const expanded = expandedThreadIds.has(thread.parent.id);
+        const canShowReplies = thread.replies.length > 0;
+        return (
+          <div className="comment-thread" key={thread.parent.id}>
+            <CommentCard comment={thread.parent} query={query} />
+            {canShowReplies && (
+              <button
+                type="button"
+                className="replies-toggle"
+                onClick={() => onToggle(thread.parent.id)}
+              >
+                {expanded
+                  ? copy.hideReplies
+                  : fill(copy.viewReplies, { label: repliesLabel(thread, copy) })}
+              </button>
+            )}
+            {expanded && <ReplyBranch nodes={thread.tree} depth={1} query={query} />}
+          </div>
+        );
+      })}
+      {canLoadMore && <div ref={sentinelRef} className="list-sentinel" />}
+    </>
+  );
+});
+
+function CommentSearchField({
+  onQuery,
+}: {
+  onQuery: (query: string) => void;
+}) {
+  const { copy } = useUiText();
+  const labelRef = useRef<HTMLLabelElement>(null);
+  const timerRef = useRef(0);
+
+  useEffect(() => () => window.clearTimeout(timerRef.current), []);
+
+  const schedule = (value: string) => {
+    labelRef.current?.classList.toggle('has-text', value.length > 0);
+    window.clearTimeout(timerRef.current);
+    timerRef.current = window.setTimeout(() => onQuery(value.trim()), 180);
+  };
+
+  return (
+    <label className="comment-search" ref={labelRef}>
+      <input
+        type="search"
+        placeholder={copy.searchPlaceholder}
+        aria-label={copy.searchPlaceholder}
+        onChange={(event) => schedule(event.currentTarget.value)}
+      />
+      <button
+        type="button"
+        className="comment-search-clear"
+        aria-label={copy.clear}
+        tabIndex={-1}
+        onClick={() => {
+          const input = labelRef.current?.querySelector('input');
+          if (!input) return;
+          input.value = '';
+          schedule('');
+          input.focus();
+        }}
+      >
+        ×
+      </button>
+    </label>
+  );
+}
+
+function CommentsPane({
+  snapshot,
+  tabId,
+  pageComments,
+  visibleCount,
+  sortOrder,
+  hideFiltered,
+  threadError,
+  isLoadingAll,
+  isBusy,
+  filterUnavailable,
+  exportKind,
+  onSortChange,
+  onToggleHideSpam,
+  onExport,
+  onLoadAll,
+  onLoadMore,
+  pageCanLoadMore,
+}: {
+  snapshot: CommentsSnapshot;
+  tabId: number;
+  pageComments: YouTubeComment[];
+  visibleCount: number;
+  sortOrder: CommentSortOrder;
+  hideFiltered: boolean;
+  threadError: string | null;
+  isLoadingAll: boolean;
+  isBusy: boolean;
+  filterUnavailable: boolean;
+  exportKind: 'csv' | 'pdf' | null;
+  onSortChange: (next: CommentSortOrder) => void;
+  onToggleHideSpam: () => void;
+  onExport: (kind: 'csv' | 'pdf') => void;
+  onLoadAll: () => void;
+  onLoadMore: () => void;
+  pageCanLoadMore: boolean;
+}) {
+  const { copy, language } = useUiText();
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchHits, setSearchHits] = useState<YouTubeComment[]>([]);
+  const [searchTotal, setSearchTotal] = useState(0);
+  const [searchOffset, setSearchOffset] = useState(0);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [expandedThreadIds, setExpandedThreadIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const searchRun = useRef(0);
+  const listRef = useRef<HTMLDivElement>(null);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const loadingMoreRef = useRef(false);
+  const tabIdRef = useRef(tabId);
+  const sortOrderRef = useRef(sortOrder);
+  const hideFilteredRef = useRef(hideFiltered);
+  tabIdRef.current = tabId;
+  sortOrderRef.current = sortOrder;
+  hideFilteredRef.current = hideFiltered;
+
+  const queryRef = useRef('');
+  const seenVideo = useRef(snapshot.videoId);
+  useEffect(() => {
+    if (seenVideo.current === snapshot.videoId) return;
+    seenVideo.current = snapshot.videoId;
+    setExpandedThreadIds(new Set());
+  }, [snapshot.videoId]);
+
+  const seenSort = useRef(sortOrder);
+  useEffect(() => {
+    if (seenSort.current === sortOrder) return;
+    seenSort.current = sortOrder;
+    setExpandedThreadIds(new Set());
+    listRef.current?.scrollTo({ top: 0 });
+  }, [sortOrder]);
+
+  const requestSearch = useCallback(async (query: string, offset: number, append: boolean) => {
+    const activeTabId = tabIdRef.current;
+    const run = append ? searchRun.current : ++searchRun.current;
+    if (!append) setSearchLoading(true);
+
+    try {
+      const response = (await browser.tabs.sendMessage(
+        activeTabId,
+        {
+          type: COMMENT_MESSAGES.searchComments,
+          query,
+          offset,
+          limit: 80,
+          sortOrder: sortOrderRef.current,
+          hideFilteredComments: hideFilteredRef.current,
+        },
+        { frameId: 0 },
+      )) as SearchCommentsResponse;
+      if (searchRun.current !== run || response.query !== query) return;
+
+      if (!append) setSearchQuery(query);
+      setSearchHits((current) => {
+        const incoming = append ? [...current, ...response.comments] : response.comments;
+        const seen = new Set<string>();
+        return incoming.filter((comment) => {
+          if (seen.has(comment.id)) return false;
+          seen.add(comment.id);
+          return true;
+        });
+      });
+      setSearchTotal(response.total);
+      setSearchOffset(response.offset + response.matchCount);
+      setExpandedThreadIds((current) => {
+        let changed = false;
+        const next = new Set(current);
+        for (const comment of response.comments) {
+          if (!comment.isReply) continue;
+          const root =
+            comment.parentId ||
+            (comment.id.includes('.') ? comment.id.slice(0, comment.id.indexOf('.')) : '');
+          if (root && !next.has(root)) {
+            next.add(root);
+            changed = true;
+          }
+        }
+        return changed ? next : current;
+      });
+    } catch {
+      if (searchRun.current !== run || append) return;
+      setSearchQuery(query);
+      setSearchHits([]);
+      setSearchTotal(0);
+      setSearchOffset(0);
+    } finally {
+      if (searchRun.current === run) setSearchLoading(false);
+    }
+  }, []);
+
+  const publishQuery = useCallback((next: string) => {
+    queryRef.current = next;
+    if (!next) {
+      searchRun.current += 1;
+      setSearchQuery('');
+      setSearchHits([]);
+      setSearchTotal(0);
+      setSearchOffset(0);
+      setSearchLoading(false);
+      return;
+    }
+    void requestSearch(next, 0, false);
+  }, [requestSearch]);
+
+  const commentRevision = `${snapshot.videoId ?? ''}:${snapshot.capturedCount}:${snapshot.fetchedAll}`;
+
+  useEffect(() => {
+    if (!queryRef.current) return;
+    void requestSearch(queryRef.current, 0, false);
+  }, [hideFiltered, sortOrder, commentRevision, requestSearch]);
+
+  const canLoadMore = searchQuery ? searchOffset < searchTotal : pageCanLoadMore;
+
+  const loadMore = useCallback(() => {
+    if (loadingMoreRef.current) return;
+    if (searchQuery) {
+      if (searchLoading || searchOffset >= searchTotal) return;
+      loadingMoreRef.current = true;
+      void requestSearch(searchQuery, searchOffset, true).finally(() => {
+        loadingMoreRef.current = false;
+      });
+      return;
+    }
+    onLoadMore();
+  }, [searchQuery, searchLoading, searchOffset, searchTotal, requestSearch, onLoadMore]);
+
+  useEffect(() => {
+    const list = listRef.current;
+    const sentinel = sentinelRef.current;
+    if (!list || !sentinel || !canLoadMore) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) loadMore();
+      },
+      { root: list, rootMargin: '120px' },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [canLoadMore, loadMore, pageComments.length, visibleCount, searchHits.length]);
+
+  const visibleThreads = useMemo(() => {
+    if (searchQuery) return groupCommentsForDisplay(searchHits, sortOrder);
+    const source = pageComments.length > 0 ? pageComments : snapshot.comments;
+    return groupCommentsForDisplay(source, sortOrder).slice(0, visibleCount);
+  }, [searchQuery, searchHits, pageComments, visibleCount, snapshot, sortOrder]);
+
+  const toggleThread = useCallback((id: string) => {
+    setExpandedThreadIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  return (
+    <section className="comments-section">
+      <div className="section-heading">
+        <div>
+          <div className="section-title-row">
+            <h2>{snapshot.fetchedAll ? copy.loadedComments : copy.capturedComments}</h2>
+            <CommentSortMenu
+              value={sortOrder}
+              onChange={onSortChange}
+              disabled={isLoadingAll}
+            />
+          </div>
+          <p>
+            {searchLoading && searchHits.length === 0
+              ? copy.searching
+              : searchQuery
+                ? fill(copy.searchMatches, {
+                    count: searchTotal.toLocaleString(language),
+                  })
+                : snapshot.truncated
+                  ? fill(copy.stoppedAt, {
+                      count: MAX_FETCHED_COMMENTS.toLocaleString(language),
+                    })
+                  : formatCapturedAt(snapshot.capturedAt, language)
+                    ? fill(copy.updatedAt, {
+                        time: formatCapturedAt(snapshot.capturedAt, language) ?? '',
+                      })
+                    : copy.updatesAsLoad}
+          </p>
+        </div>
+        <div className="section-actions">
+          <div className="filter-control">
+            <label
+              className={`auto-switch filter-switch${filterUnavailable ? ' is-unavailable' : ''}`}
+              title={filterUnavailable ? copy.hideSpamUnavailable : copy.hideSpamTitle}
+            >
+              <span>{copy.hideSpam}</span>
+              <input
+                type="checkbox"
+                checked={hideFiltered}
+                disabled={filterUnavailable}
+                onChange={onToggleHideSpam}
+              />
+              <span className="switch-track" />
+            </label>
+            <p className="filter-count">
+              {hideFiltered &&
+              !filterUnavailable &&
+              snapshot.fetchedAll &&
+              snapshot.filteredCount > 0
+                ? fill(copy.spamHidden, {
+                    count: snapshot.filteredCount.toLocaleString(language),
+                  })
+                : ''}
+            </p>
+          </div>
+        </div>
+      </div>
+      {threadError && <p className="thread-error">{threadError}</p>}
+
+      <div className="comment-toolbar">
+        <div className="toolbar-actions">
+          <CommentSearchField onQuery={publishQuery} />
+          <button
+            type="button"
+            className="toolbar-button"
+            onClick={() => onExport('csv')}
+            disabled={isLoadingAll || exportKind !== null}
+            title={copy.exportCsvTitle}
+          >
+            {exportKind === 'csv' ? copy.exporting : copy.exportCsv}
+          </button>
+          <button
+            type="button"
+            className="toolbar-button"
+            onClick={() => onExport('pdf')}
+            disabled={isLoadingAll || exportKind !== null}
+            title={copy.exportPdfTitle}
+          >
+            {exportKind === 'pdf' ? copy.exporting : copy.exportPdf}
+          </button>
+          <button
+            type="button"
+            className="toolbar-button"
+            onClick={onLoadAll}
+            disabled={isBusy}
+          >
+            {isLoadingAll ? copy.loadingShort : copy.loadAll}
+          </button>
+        </div>
+      </div>
+
+      <div className="comment-list" ref={listRef}>
+        <CommentThreadList
+          threads={visibleThreads}
+          query={searchQuery}
+          expandedThreadIds={expandedThreadIds}
+          emptyLabel={searchQuery ? copy.searchEmpty : copy.commentsArriving}
+          onToggle={toggleThread}
+          canLoadMore={canLoadMore}
+          sentinelRef={sentinelRef}
+        />
+      </div>
+    </section>
+  );
+}
+
+function formatCapturedAt(value: string | null, locale: string): string | null {
   if (!value) return null;
 
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
 
-  return date.toLocaleTimeString([], {
+  return date.toLocaleTimeString(locale, {
     hour: '2-digit',
     minute: '2-digit',
   });
@@ -447,16 +895,12 @@ function App() {
   const [chatError, setChatError] = useState<string | null>(null);
   const summaryRunId = useRef(0);
   const summaryInFlightRef = useRef(false);
-  const listRef = useRef<HTMLDivElement>(null);
-  const sentinelRef = useRef<HTMLDivElement>(null);
+  const summaryStartedAt = useRef(0);
+  const autoSummaryKick = useRef('');
   const loadingMoreRef = useRef(false);
-  const pageCommentsRef = useRef<YouTubeComment[]>([]);
   const visibleCountRef = useRef(COMMENTS_PAGE_SIZE);
   const [pageComments, setPageComments] = useState<YouTubeComment[]>([]);
   const [visibleCount, setVisibleCount] = useState(COMMENTS_PAGE_SIZE);
-  const [expandedThreadIds, setExpandedThreadIds] = useState<Set<string>>(
-    () => new Set(),
-  );
   // YouTube opens every video on "Top", so the popup does too.
   const [sortOrder, setSortOrder] = useState<CommentSortOrder>(
     DEFAULT_COMMENT_SORT_ORDER,
@@ -466,11 +910,13 @@ function App() {
   const [hideFiltered, setHideFiltered] = useState(false);
   const hideFilteredRef = useRef(hideFiltered);
   hideFilteredRef.current = hideFiltered;
+  const settingsReady = useRef(false);
   const [replyLanguage, setReplyLanguage] = useState(DEFAULT_REPLY_LANGUAGE);
   const [languageOpen, setLanguageOpen] = useState(false);
   const languageAnchorRef = useRef<HTMLDivElement>(null);
   const replyLanguageRef = useRef(replyLanguage);
   replyLanguageRef.current = replyLanguage;
+  const copy = useMemo(() => uiText(replyLanguage), [replyLanguage]);
   const activeVideoId =
     state.kind === 'ready' ? state.snapshot.videoId : null;
   const activeVideoIdRef = useRef(activeVideoId);
@@ -478,6 +924,7 @@ function App() {
   const targetRef = useRef(readPopupTarget());
 
   const loadSnapshot = useCallback(async (silent = false) => {
+    if (!settingsReady.current) return;
     if (!silent) setIsRefreshing(true);
 
     try {
@@ -503,12 +950,15 @@ function App() {
   }, []);
 
   useEffect(() => {
-    void loadSnapshot(true);
     void browser.storage.local
       .get([AUTO_SUMMARIZE_KEY, HIDE_FILTERED_KEY])
       .then((stored) => {
+        const hide = stored[HIDE_FILTERED_KEY] === true;
+        hideFilteredRef.current = hide;
+        setHideFiltered(hide);
         setAutoSummarize(stored[AUTO_SUMMARIZE_KEY] === true);
-        setHideFiltered(stored[HIDE_FILTERED_KEY] === true);
+        settingsReady.current = true;
+        void loadSnapshot(true);
       });
     void getReplyLanguage().then((language) => {
       setReplyLanguage(language);
@@ -516,7 +966,11 @@ function App() {
 
     const applySummary = (summary: SavedSummary | undefined) => {
       if (!summary || summary.videoId !== activeVideoIdRef.current) return;
-      if (summary.language !== replyLanguageRef.current) return;
+      if (summary.language && summary.language !== replyLanguageRef.current) return;
+      const started = summaryStartedAt.current;
+      if (started && Date.parse(summary.generatedAt) + 1_500 < started) return;
+      summaryInFlightRef.current = false;
+      summaryStartedAt.current = 0;
       setSummaryState({ kind: 'success', value: summary });
     };
 
@@ -571,9 +1025,11 @@ function App() {
         const videoId = activeVideoIdRef.current;
         if (!videoId) return;
         applySummary(
-          (cache as Record<string, SavedSummary>)[
-            summaryCacheKey(videoId, replyLanguageRef.current)
-          ],
+          findCachedSummary(
+            cache as Record<string, SavedSummary>,
+            videoId,
+            replyLanguageRef.current,
+          ),
         );
       }
     };
@@ -621,8 +1077,11 @@ function App() {
 
     void readSummaryCache()
       .then((cache) => {
-        const cachedSummary =
-          cache[summaryCacheKey(activeVideoId, replyLanguage)];
+        const cachedSummary = findCachedSummary(
+          cache,
+          activeVideoId,
+          replyLanguage,
+        );
         if (
           cachedSummary?.language === replyLanguage &&
           summaryRunId.current === runId
@@ -654,6 +1113,13 @@ function App() {
 
   useEffect(() => {
     if (state.kind !== 'ready') return;
+    if (
+      summaryState.kind === 'working' &&
+      summaryState.previous &&
+      summaryStartedAt.current > 0
+    ) {
+      return;
+    }
     if (summaryInFlightRef.current) return;
 
     const { snapshot } = state;
@@ -665,36 +1131,44 @@ function App() {
 
     if (snapshot.autoPhase === 'fetching') {
       const count = snapshot.loadAllCount ?? capturedCount(snapshot);
-      const message = `Loading comments from YouTube… ${count}`;
-      if (summaryState.kind !== 'working' || summaryState.message !== message) {
-        setSummaryState({ kind: 'working', message });
+      const message = fill(copy.loadingCount, { count });
+      if (
+        summaryState.kind !== 'working' ||
+        summaryState.message !== message ||
+        summaryState.phase !== 'fetching'
+      ) {
+        setSummaryState({ kind: 'working', message, phase: 'fetching' });
       }
       return;
     }
 
     if (snapshot.autoPhase === 'summarizing') {
-      const message = 'Sending comments to the secure summary service…';
-      if (summaryState.kind !== 'working' || summaryState.message !== message) {
-        setSummaryState({ kind: 'working', message });
+      const message = fill(copy.sendingComments, {
+        count: capturedCount(snapshot),
+      });
+      if (
+        summaryState.kind !== 'working' ||
+        summaryState.message !== message ||
+        summaryState.phase !== 'sending'
+      ) {
+        setSummaryState({ kind: 'working', message, phase: 'sending' });
       }
       return;
     }
 
     if (summaryState.kind === 'working' && snapshot.status === 'loading-all') {
       const count = snapshot.loadAllCount ?? capturedCount(snapshot);
-      const message = `Loading comments from YouTube… ${count}`;
-      if (summaryState.message !== message) {
-        setSummaryState({ kind: 'working', message });
+      const message = fill(copy.loadingCount, { count });
+      if (summaryState.message !== message || summaryState.phase !== 'loading-all') {
+        setSummaryState({ kind: 'working', message, phase: 'loading-all' });
       }
       return;
     }
 
     if (snapshot.autoError) {
-      if (
-        summaryState.kind !== 'error' ||
-        summaryState.message !== snapshot.autoError
-      ) {
-        setSummaryState({ kind: 'error', message: snapshot.autoError });
+      const message = localizeMessage(snapshot.autoError, copy);
+      if (summaryState.kind !== 'error' || summaryState.message !== message) {
+        setSummaryState({ kind: 'error', message });
       }
       return;
     }
@@ -703,18 +1177,23 @@ function App() {
       summaryState.kind === 'working' &&
       snapshot.autoPhase === 'idle' &&
       videoId &&
-      summaryState.message.startsWith('Loading comments from YouTube')
+      (summaryState.phase === 'fetching' ||
+        summaryState.phase === 'sending' ||
+        summaryState.phase === 'loading-all')
     ) {
       void readSummaryCache().then((cache) => {
-        if (summaryInFlightRef.current) return;
-        const cachedSummary =
-          cache[summaryCacheKey(videoId, replyLanguageRef.current)];
+        if (summaryInFlightRef.current || summaryStartedAt.current > 0) return;
+        const cachedSummary = findCachedSummary(
+          cache,
+          videoId,
+          replyLanguageRef.current,
+        );
         if (cachedSummary?.language === replyLanguageRef.current) {
           setSummaryState({ kind: 'success', value: cachedSummary });
         }
       });
     }
-  }, [state, summaryState]);
+  }, [state, summaryState, copy]);
 
   const jumpToComments = async () => {
     if (state.kind !== 'ready') return;
@@ -735,6 +1214,26 @@ function App() {
     }
   };
 
+  const refreshFromYouTube = async () => {
+    if (isRefreshing) return;
+    setIsRefreshing(true);
+    setThreadError(null);
+
+    try {
+      if (state.kind !== 'ready') {
+        await loadSnapshot(true);
+        return;
+      }
+
+      const response = await loadAllComments();
+      if (response && !response.ok) {
+        setThreadError(localizeMessage(response.error ?? copy.refreshThenLoad, copy));
+      }
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
+
   const loadAllComments = async (): Promise<LoadAllCommentsResponse | null> => {
     if (state.kind !== 'ready') return null;
 
@@ -751,49 +1250,75 @@ function App() {
     }
   };
 
-  const summarizeFromPage = (runId: number, count: number) => {
+  const summarizeFromPage = (
+    runId: number,
+    count: number,
+    previous?: SavedSummary,
+  ) => {
     if (state.kind !== 'ready') return;
 
     if (count === 0) {
       summaryInFlightRef.current = false;
       setSummaryState({
         kind: 'error',
-        message: 'No comments were found to summarize.',
+        message: copy.noCommentsToSummarize,
       });
       return;
     }
 
     summaryInFlightRef.current = true;
+    summaryStartedAt.current = Date.now();
+    const requestedLanguage = replyLanguageRef.current;
     setSummaryState({
       kind: 'working',
-      message: `Sending ${count} comments to the secure summary service…`,
+      message: fill(copy.sendingComments, { count }),
+      phase: 'sending',
+      previous,
     });
 
     void browser.tabs
       .sendMessage(state.tabId, {
         type: COMMENT_MESSAGES.summarizeLoaded,
-        language: replyLanguageRef.current,
+        language: requestedLanguage,
       })
       .then((response) => {
         if (summaryRunId.current !== runId) return;
         const result = response as SummarizeLoadedResponse;
-        if (result?.ok && result.summary) {
-          if (result.summary.language === replyLanguageRef.current) {
-            setSummaryState({ kind: 'success', value: result.summary });
-          }
+        const summary = result?.summary;
+        if (result?.ok && summary?.text && summary.videoId === activeVideoIdRef.current) {
+          summaryInFlightRef.current = false;
+          summaryStartedAt.current = 0;
+          setSummaryState({
+            kind: 'success',
+            value: { ...summary, language: summary.language || requestedLanguage },
+          });
           return;
         }
 
-        setSummaryState({
-          kind: 'error',
-          message: result?.error || 'The comments could not be summarized.',
-        });
+        if (result && result.ok === false) {
+          summaryStartedAt.current = 0;
+          setSummaryState({
+            kind: 'error',
+            message: localizeMessage(result.error || copy.couldNotSummarize, copy),
+          });
+        }
       })
       .catch(() => {
         if (summaryRunId.current !== runId) return;
-        setSummaryState({
-          kind: 'error',
-          message: 'Refresh the YouTube tab, then try summarizing again.',
+        void readSummaryCache().then((cache) => {
+          if (summaryRunId.current !== runId) return;
+          const videoId = activeVideoIdRef.current;
+          const cached = videoId
+            ? findCachedSummary(cache, videoId, requestedLanguage)
+            : undefined;
+          if (
+            cached &&
+            Date.parse(cached.generatedAt) + 1_500 >= summaryStartedAt.current
+          ) {
+            summaryInFlightRef.current = false;
+            summaryStartedAt.current = 0;
+            setSummaryState({ kind: 'success', value: cached });
+          }
         });
       })
       .finally(() => {
@@ -818,7 +1343,8 @@ function App() {
     const runId = ++summaryRunId.current;
     setSummaryState({
       kind: 'working',
-      message: 'Loading all comments from YouTube…',
+      message: copy.loadingFromYouTube,
+      phase: 'loading-all',
     });
 
     void loadAllComments()
@@ -828,7 +1354,7 @@ function App() {
         if (!response) {
           setSummaryState({
             kind: 'error',
-            message: 'Refresh the YouTube tab, then try summarizing again.',
+            message: copy.refreshThenSummarize,
           });
           return;
         }
@@ -841,16 +1367,14 @@ function App() {
           if (capturedCount(latest) > 0) {
             setSummaryState({
               kind: 'error',
-              message: `${response.error ?? 'Could not load the full comment thread.'} You can still summarize the ${capturedCount(latest)} comments already captured.`,
+              message: `${localizeMessage(response.error ?? copy.couldNotLoadThread, copy)} ${fill(copy.canStillSummarize, { count: capturedCount(latest) })}`,
             });
             return;
           }
 
           setSummaryState({
             kind: 'error',
-            message:
-              response.error ??
-              'Could not load comments. Scroll to the comments section once, then try again.',
+            message: localizeMessage(response.error ?? copy.couldNotLoadComments, copy),
           });
           return;
         }
@@ -861,7 +1385,7 @@ function App() {
         if (summaryRunId.current === runId) {
           setSummaryState({
             kind: 'error',
-            message: 'Refresh the YouTube tab, then try summarizing again.',
+            message: copy.refreshThenSummarize,
           });
         }
       });
@@ -871,7 +1395,10 @@ function App() {
     if (state.kind !== 'ready' || exportKind) return;
 
     const { snapshot, tabId } = state;
-    const spamHidden = hideFilteredRef.current && canFilter;
+    const spamHidden =
+      hideFilteredRef.current &&
+      state.snapshot.fetchedAll &&
+      !state.snapshot.truncated;
     setExportKind(kind);
     setThreadError(null);
 
@@ -890,14 +1417,12 @@ function App() {
         groupCommentsForDisplay(response.comments, sortOrderRef.current),
       );
       if (rows.length === 0) {
-        setThreadError('No comments to export with the current filter.');
+        setThreadError(copy.noCommentsToExport);
         return;
       }
 
       const sortLabel =
-        COMMENT_SORT_OPTIONS.find(
-          (option) => option.value === sortOrderRef.current,
-        )?.label ?? 'Top';
+        sortOrderRef.current === 'newest' ? copy.sortNewest : copy.sortTop;
       const meta: CommentExportMeta = {
         videoTitle: snapshot.videoTitle,
         channelName: snapshot.channelName,
@@ -917,9 +1442,7 @@ function App() {
           : await commentsToPdf(rows, meta);
       downloadBlob(blob, filename);
     } catch {
-      setThreadError(
-        'Could not export comments. Refresh the YouTube tab, then try again.',
-      );
+      setThreadError(copy.couldNotExport);
     } finally {
       setExportKind(null);
     }
@@ -931,30 +1454,79 @@ function App() {
 
     void loadAllComments().then((response) => {
       if (!response) {
-        setThreadError('Refresh the YouTube tab, then try loading comments again.');
+        setThreadError(copy.refreshThenLoad);
         return;
       }
 
       if (!response.ok) {
-        setThreadError(
-          response.error ??
-            'Could not load comments. Scroll to the comments section once, then try again.',
-        );
+        setThreadError(localizeMessage(response.error ?? copy.couldNotLoadComments, copy));
       }
     });
   };
 
   const summarizeCapturedComments = () => {
     if (state.kind !== 'ready') return;
-    if (summaryInFlightRef.current || summaryState.kind === 'working') return;
+    if (summaryState.kind === 'working') return;
 
     const { snapshot } = state;
     const videoId = snapshot.videoId;
     const count = capturedCount(snapshot);
     if (!videoId || count === 0) return;
 
-    summarizeFromPage(++summaryRunId.current, count);
+    summaryInFlightRef.current = false;
+    const previous = summaryState.kind === 'success' ? summaryState.value : undefined;
+    summarizeFromPage(++summaryRunId.current, count, previous);
   };
+
+  useEffect(() => {
+    if (summaryState.kind !== 'working' || summaryStartedAt.current === 0) return;
+
+    let cancelled = false;
+    const startedAt = summaryStartedAt.current;
+    const look = async () => {
+      const videoId = activeVideoIdRef.current;
+      const language = replyLanguageRef.current;
+      if (!videoId) return;
+      const cached = findCachedSummary(await readSummaryCache(), videoId, language);
+      if (cancelled || !cached) return;
+      if (Date.parse(cached.generatedAt) + 1_500 < startedAt) return;
+      summaryInFlightRef.current = false;
+      summaryStartedAt.current = 0;
+      setSummaryState({ kind: 'success', value: cached });
+    };
+
+    void look();
+    const timer = window.setInterval(() => void look(), 1_500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [summaryState]);
+
+  useEffect(() => {
+    if (!autoSummarize || state.kind !== 'ready') return;
+    if (summaryState.kind !== 'idle' || summaryInFlightRef.current) return;
+
+    const snapshot = state.snapshot;
+    if (!snapshot.fetchedAll || snapshot.autoError || !snapshot.videoId) return;
+    if (snapshot.autoPhase === 'fetching' || snapshot.autoPhase === 'summarizing') return;
+    if (capturedCount(snapshot) === 0) return;
+
+    const kick = `${snapshot.videoId}:${replyLanguage}`;
+    if (autoSummaryKick.current === kick) return;
+    autoSummaryKick.current = kick;
+
+    const videoId = snapshot.videoId;
+    void readSummaryCache().then((cache) => {
+      if (autoSummaryKick.current !== kick || summaryInFlightRef.current) return;
+      const cached = findCachedSummary(cache, videoId, replyLanguage);
+      if (cached) {
+        setSummaryState({ kind: 'success', value: cached });
+        return;
+      }
+      summarizeCapturedComments();
+    });
+  }, [autoSummarize, replyLanguage, state, summaryState.kind]);
 
   const sendChatQuestion = async (question: string) => {
     if (state.kind !== 'ready' || chatSending) return;
@@ -984,7 +1556,7 @@ function App() {
 
       if (!response?.ok || !response.answer) {
         setChatError(
-          response?.error || 'The comments could not be asked about.',
+          localizeMessage(response?.error || copy.couldNotAsk, copy),
         );
         return;
       }
@@ -999,7 +1571,7 @@ function App() {
       setChatMessages(next);
       await saveVideoChat(videoId, next);
     } catch {
-      setChatError('Refresh the YouTube tab, then try asking again.');
+      setChatError(copy.refreshThenAsk);
     } finally {
       setChatSending(false);
     }
@@ -1021,16 +1593,13 @@ function App() {
     if (state.kind !== 'ready') {
       setPageComments([]);
       setVisibleCount(COMMENTS_PAGE_SIZE);
-      setExpandedThreadIds(new Set());
       return;
     }
 
     setPageComments(state.snapshot.comments);
     setVisibleCount(COMMENTS_PAGE_SIZE);
-    setExpandedThreadIds(new Set());
   }, [streamKey]);
 
-  pageCommentsRef.current = pageComments;
   visibleCountRef.current = visibleCount;
 
   const refreshVisibleComments = useCallback(
@@ -1057,12 +1626,18 @@ function App() {
 
   useEffect(() => {
     if (state.kind !== 'ready') return;
+    // A snapshot that started before the switch moved still carries the old
+    // filter. Applying it would put the hidden comments back on screen.
+    if (state.snapshot.hideFilteredComments !== hideFilteredRef.current) {
+      void refreshVisibleComments(visibleCountRef.current);
+      return;
+    }
     if (visibleCountRef.current > COMMENTS_PAGE_SIZE) {
       void refreshVisibleComments(visibleCountRef.current);
       return;
     }
     setPageComments(state.snapshot.comments);
-  }, [state, refreshVisibleComments]);
+  }, [state, refreshVisibleComments, hideFiltered]);
 
   const loadMoreComments = useCallback(async () => {
     if (state.kind !== 'ready' || loadingMoreRef.current) return;
@@ -1098,36 +1673,9 @@ function App() {
     }
   }, [state]);
 
-  const canLoadMore =
+  const pageCanLoadMore =
     state.kind === 'ready' &&
     visibleCount < listedThreadCount(state.snapshot, sortOrder);
-
-  useEffect(() => {
-    const list = listRef.current;
-    const sentinel = sentinelRef.current;
-    if (!list || !sentinel || !canLoadMore) return;
-
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) {
-          void loadMoreComments();
-        }
-      },
-      { root: list, rootMargin: '120px' },
-    );
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  }, [canLoadMore, loadMoreComments, pageComments.length, visibleCount]);
-
-  const visibleThreads = useMemo(() => {
-    const source =
-      pageComments.length > 0
-        ? pageComments
-        : state.kind === 'ready'
-          ? state.snapshot.comments
-          : [];
-    return groupCommentsForDisplay(source, sortOrder).slice(0, visibleCount);
-  }, [pageComments, visibleCount, state, sortOrder]);
 
   // Switching order rewinds the list to the top, the way YouTube reloads the
   // thread when you pick a different sort.
@@ -1137,38 +1685,48 @@ function App() {
     sortOrderRef.current = next;
     setSortOrder(next);
     setVisibleCount(COMMENTS_PAGE_SIZE);
-    setExpandedThreadIds(new Set());
-    listRef.current?.scrollTo({ top: 0 });
     void refreshVisibleComments(COMMENTS_PAGE_SIZE, next);
-  };
-
-  const toggleThread = (id: string) => {
-    setExpandedThreadIds((current) => {
-      const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
   };
 
   const isLoadingAll =
     state.kind === 'ready' && state.snapshot.status === 'loading-all';
-  // Only a complete walk of the thread can tell a filtered comment apart from
-  // one that simply has not been fetched.
-  const canFilter =
+  // A capped thread cannot tell held comments from ones the Top pass never
+  // reached. Until the first full load, the switch itself starts that load.
+  const filterUnavailable =
     state.kind === 'ready' &&
     state.snapshot.fetchedAll &&
-    !state.snapshot.truncated;
+    state.snapshot.truncated;
   const isBusy = isLoadingAll || summaryState.kind === 'working' || chatSending;
+  const toggleHideSpam = () => {
+    const next = !hideFiltered;
+    hideFilteredRef.current = next;
+    setHideFiltered(next);
+    setVisibleCount(COMMENTS_PAGE_SIZE);
+    void setHideFilteredComments(next);
+
+    const needsFetch =
+      next &&
+      state.kind === 'ready' &&
+      !state.snapshot.fetchedAll &&
+      !isLoadingAll;
+    if (needsFetch) {
+      void loadAllComments().finally(() => {
+        void refreshVisibleComments(COMMENTS_PAGE_SIZE);
+      });
+      return;
+    }
+
+    void refreshVisibleComments(COMMENTS_PAGE_SIZE);
+  };
+  const shownSummary =
+    summaryState.kind === 'success'
+      ? summaryState.value
+      : summaryState.kind === 'working'
+        ? summaryState.previous
+        : undefined;
+  const summaryUpdating = summaryState.kind === 'working' && Boolean(shownSummary);
   const commentsDisabled =
     state.kind === 'ready' && state.snapshot.status === 'no-comments';
-  const loadedCountLabel =
-    state.kind === 'ready' && state.snapshot.fetchedAll
-      ? state.snapshot.truncated
-        ? `loaded (first ${MAX_FETCHED_COMMENTS})`
-        : 'loaded'
-      : 'captured';
-
   const renderEmptyState = (
     title: string,
     description: string,
@@ -1182,27 +1740,27 @@ function App() {
       <p>{description}</p>
       {showJumpButton && (
         <button className="primary-button" onClick={jumpToComments}>
-          Jump to comments
+          {copy.jumpToComments}
         </button>
       )}
     </section>
   );
 
   return (
-    <div className="app-shell">
+    <UiTextProvider language={replyLanguage}>
+    <div className="app-shell" lang={replyLanguage}>
       <header className="app-header">
         <div className="brand-mark">
           <CommentIcon />
         </div>
         <div className="brand-copy">
-          <span>YOUTUBE TOOL</span>
           <h1>Comment Catcher</h1>
         </div>
         <div className="language-anchor" ref={languageAnchorRef}>
           <button
             type="button"
             className="icon-button"
-            aria-label={`Summary and chat language, ${languageLabel(replyLanguage)}`}
+            aria-label={`${copy.languageMenu}, ${languageLabel(replyLanguage)}`}
             aria-expanded={languageOpen}
             aria-haspopup="listbox"
             title={languageLabel(replyLanguage)}
@@ -1211,8 +1769,14 @@ function App() {
             <EarthIcon />
           </button>
           {languageOpen && (
-            <ul className="language-menu" role="listbox" aria-label="Summary and chat language">
-              {REPLY_LANGUAGES.map((language) => (
+            <ul className="language-menu" role="listbox" aria-label={copy.languageMenu}>
+              {[...REPLY_LANGUAGES]
+                .sort((first, second) =>
+                  first.label.localeCompare(second.label, 'en', {
+                    sensitivity: 'base',
+                  }),
+                )
+                .map((language) => (
                 <li key={language.code}>
                   <button
                     type="button"
@@ -1234,9 +1798,9 @@ function App() {
         </div>
         <label
           className="auto-switch"
-          title="Fetch and summarize comments when a video opens"
+          title={copy.autoTitle}
         >
-          <span>Auto</span>
+          <span>{copy.auto}</span>
           <input
             type="checkbox"
             checked={autoSummarize}
@@ -1252,8 +1816,8 @@ function App() {
           <button
             type="button"
             className="icon-button"
-            aria-label="Open in a window"
-            title="Open in a resizable window"
+            aria-label={copy.openWindow}
+            title={copy.openWindowTitle}
             onClick={() => void openDetachedWindow()}
           >
             <WindowIcon />
@@ -1261,9 +1825,9 @@ function App() {
         )}
         <button
           className="icon-button"
-          aria-label="Refresh captured comments"
-          title="Refresh"
-          onClick={() => void loadSnapshot()}
+          aria-label={copy.refreshTitle}
+          title={copy.refresh}
+          onClick={() => void refreshFromYouTube()}
           disabled={isRefreshing}
         >
           <RefreshIcon />
@@ -1274,37 +1838,31 @@ function App() {
         {state.kind === 'loading' && (
           <section className="loading-state" aria-live="polite">
             <span className="spinner" />
-            <p>Connecting to this page…</p>
+            <p>{copy.connectingToPage}</p>
           </section>
         )}
 
         {state.kind === 'unsupported' &&
-          renderEmptyState(
-            'Open a YouTube video',
-            'This extension collects comments from standard YouTube video pages.',
-          )}
+          renderEmptyState(copy.openYouTubeVideo, copy.openYouTubeVideoHint)}
 
         {state.kind === 'unavailable' &&
-          renderEmptyState(
-            'Refresh the YouTube tab',
-            'The collector could not connect. Refresh the video page once, then open this popup again.',
-          )}
+          renderEmptyState(copy.refreshYouTubeTab, copy.collectorHint)}
 
         {state.kind === 'ready' && (
           <>
             <section className="video-card">
               <div className={`status status-${state.snapshot.status}`}>
                 <span className="status-dot" />
-                {statusLabel(state.snapshot.status)}
+                {statusLabel(state.snapshot.status, copy)}
               </div>
-              <h2>{state.snapshot.videoTitle || 'YouTube video'}</h2>
+              <h2>{state.snapshot.videoTitle || copy.youtubeVideo}</h2>
               {state.snapshot.channelName && (
                 <p className="channel-name">{state.snapshot.channelName}</p>
               )}
 
               <div
                 className="metrics"
-                title="YouTube's total is an estimate and includes replies. Some comments are hidden or never returned by YouTube."
+                title={copy.countTooltip}
               >
                 <div>
                   <strong>
@@ -1313,23 +1871,26 @@ function App() {
                         capturedCount(state.snapshot))
                       : capturedCount(state.snapshot)}
                   </strong>
-                  <span>{isLoadingAll ? 'loading' : loadedCountLabel}</span>
+                  <span>
+                    {isLoadingAll
+                      ? copy.metricLoading
+                      : state.snapshot.fetchedAll
+                        ? copy.metricLoaded
+                        : copy.metricCaptured}
+                  </span>
                 </div>
                 <div className="metric-divider" />
                 <div>
                   <strong className="total-label">
                     {state.snapshot.totalCommentsLabel || '—'}
                   </strong>
-                  <span>listed by YouTube</span>
+                  <span>{copy.listedByYouTube}</span>
                 </div>
               </div>
             </section>
 
             {commentsDisabled &&
-              renderEmptyState(
-                'Comments are unavailable',
-                'This video may have comments disabled.',
-              )}
+              renderEmptyState(copy.commentsUnavailable, copy.commentsDisabledHint)}
 
             {!commentsDisabled && (
               <>
@@ -1340,19 +1901,21 @@ function App() {
                         <SparklesIcon />
                       </span>
                       <div>
-                        <h2>AI summary</h2>
-                        <p>One paragraph from the full comment thread</p>
+                        <h2>{copy.aiSummary}</h2>
+                        <p>{copy.aiSummaryHint}</p>
                       </div>
                     </div>
-                    <span className="ai-badge">Cloud AI</span>
+                    <span className="ai-badge">{copy.cloudAi}</span>
                   </div>
 
                   {summaryState.kind === 'idle' && (
                     <div className="summary-intro">
                       <p>
                         {autoSummarize
-                          ? 'Auto summarize is on. Opening a video loads comments and saves the paragraph here.'
-                          : `Load the comment thread from YouTube, then summarize up to ${MAX_FETCHED_COMMENTS.toLocaleString()} comments with Gemini. You do not need to scroll the page.`}
+                          ? copy.autoSummarizeOn
+                          : fill(copy.summarizeIntro, {
+                              count: MAX_FETCHED_COMMENTS.toLocaleString(replyLanguage),
+                            })}
                       </p>
                       <button
                         className="summary-button"
@@ -1360,18 +1923,13 @@ function App() {
                         disabled={isBusy}
                       >
                         <SparklesIcon />
-                        {autoSummarize
-                          ? 'Summarize this video now'
-                          : 'Summarize all comments'}
+                        {autoSummarize ? copy.summarizeNow : copy.summarizeAll}
                       </button>
-                      <small>
-                        Comment text is sent to Gemini through your secure
-                        backend. Most videos load in a few seconds.
-                      </small>
+                      <small>{copy.privacyNote}</small>
                     </div>
                   )}
 
-                  {summaryState.kind === 'working' && (
+                  {summaryState.kind === 'working' && !summaryState.previous && (
                     <div
                       className="summary-working"
                       role="status"
@@ -1386,9 +1944,9 @@ function App() {
                             (state.snapshot.autoPhase === 'fetching' ||
                               state.snapshot.autoPhase === 'summarizing'))
                             ? autoSummarize
-                              ? 'This runs in the tab. You can close the popup.'
-                              : 'Fetching the thread in the background. Keep this popup open.'
-                            : 'This normally takes only a few seconds.'}
+                              ? copy.runsInTab
+                              : copy.keepPopupOpen
+                            : copy.takesSeconds}
                         </span>
                       </div>
                     </div>
@@ -1407,37 +1965,47 @@ function App() {
                           }
                           disabled={isBusy}
                         >
-                          Try again
+                          {copy.tryAgain}
                         </button>
                       </div>
                     </div>
                   )}
 
-                  {summaryState.kind === 'success' && (
-                    <div className="summary-result">
-                      <p className="summary-text">
-                        {summaryState.value.text}
-                      </p>
+                  {(shownSummary) && (
+                    <div className={`summary-result${summaryUpdating ? ' is-updating' : ''}`}>
+                      <p className="summary-text">{shownSummary.text}</p>
                       <div className="summary-result-footer">
                         <span>
-                          Based on {summaryState.value.commentCount} comments
-                          {summaryState.value.language &&
-                            ` • ${languageLabel(summaryState.value.language)}`}
-                          {summaryState.value.model &&
-                            ` • ${summaryState.value.model}`}
-                          {summaryState.value.commentCount !==
-                            capturedCount(state.snapshot) &&
-                            ' • New comments are available'}
-                          {state.snapshot.truncated &&
-                            ` • Capped at ${MAX_FETCHED_COMMENTS.toLocaleString()}`}
+                          {summaryUpdating
+                            ? summaryState.kind === 'working'
+                              ? summaryState.message
+                              : ''
+                            : fill(copy.basedOn, {
+                                count: shownSummary.commentCount.toLocaleString(replyLanguage),
+                              })}
+                          {!summaryUpdating &&
+                            shownSummary.language &&
+                            ` • ${languageName(shownSummary.language, replyLanguage)}`}
+                          {!summaryUpdating &&
+                            shownSummary.model &&
+                            ` • ${shownSummary.model}`}
+                          {!summaryUpdating &&
+                            shownSummary.commentCount !== capturedCount(state.snapshot) &&
+                            ` • ${copy.newComments}`}
+                          {!summaryUpdating &&
+                            state.snapshot.truncated &&
+                            ` • ${fill(copy.cappedAt, {
+                              count: MAX_FETCHED_COMMENTS.toLocaleString(replyLanguage),
+                            })}`}
                         </span>
                         <button
                           className="text-button"
                           onClick={summarizeCapturedComments}
                           disabled={isBusy || capturedCount(state.snapshot) === 0}
-                          title="Summarize the comments already loaded"
+                          title={copy.updateTitle}
                         >
-                          Update
+                          {summaryUpdating && <span className="summary-spinner is-inline" />}
+                          {copy.update}
                         </button>
                       </div>
                     </div>
@@ -1447,17 +2015,17 @@ function App() {
                 <ChatPanel
                   disabled={
                     capturedCount(state.snapshot) === 0 ||
-                    summaryState.kind === 'working' ||
+                    (summaryState.kind === 'working' && !summaryState.previous) ||
                     isLoadingAll
                   }
                   disabledReason={
                     capturedCount(state.snapshot) === 0
-                      ? 'Load comments first to ask about this video.'
-                      : isLoadingAll || summaryState.kind === 'working'
-                        ? 'Wait until comments finish loading or summarizing.'
+                      ? copy.loadCommentsFirst
+                      : isLoadingAll ||
+                          (summaryState.kind === 'working' && !summaryState.previous)
+                        ? copy.waitUntilLoaded
                         : ''
                   }
-                  languageLabel={languageLabel(replyLanguage)}
                   sending={chatSending}
                   error={chatError}
                   messages={chatMessages}
@@ -1470,11 +2038,8 @@ function App() {
                     <div className="empty-icon">
                       <CommentIcon />
                     </div>
-                    <h2>Load comments without scrolling</h2>
-                    <p>
-                      The extension can request the comment thread from YouTube
-                      instead of waiting for comments to appear on the page.
-                    </p>
+                    <h2>{copy.loadWithoutScrolling}</h2>
+                    <p>{copy.loadWithoutScrollingHint}</p>
                     {threadError && <p className="thread-error">{threadError}</p>}
                     <div className="empty-actions">
                       <button
@@ -1482,156 +2047,39 @@ function App() {
                         onClick={handleLoadAll}
                         disabled={isBusy}
                       >
-                        Load all comments
+                        {copy.loadAllComments}
                       </button>
                       <button
                         className="text-button"
                         onClick={jumpToComments}
                         disabled={isBusy}
                       >
-                        Jump to comments
+                        {copy.jumpToComments}
                       </button>
                     </div>
                   </section>
                 )}
 
                 {(capturedCount(state.snapshot) > 0 || isLoadingAll) && (
-                <section className="comments-section">
-                  <div className="section-heading">
-                    <div>
-                      <div className="section-title-row">
-                        <h2>
-                          {state.snapshot.fetchedAll
-                            ? 'Loaded comments'
-                            : 'Captured comments'}
-                        </h2>
-                        <CommentSortMenu
-                          value={sortOrder}
-                          onChange={changeSortOrder}
-                          disabled={isLoadingAll}
-                        />
-                      </div>
-                      <p>
-                        {state.snapshot.truncated
-                          ? `Stopped at ${MAX_FETCHED_COMMENTS.toLocaleString()} comments`
-                          : formatCapturedAt(state.snapshot.capturedAt)
-                            ? `Updated ${formatCapturedAt(state.snapshot.capturedAt)}`
-                            : 'Updates as comments load'}
-                      </p>
-                    </div>
-                      <div className="section-actions">
-                        <div className="filter-control">
-                          <label
-                            className={`auto-switch filter-switch${canFilter ? '' : ' is-unavailable'}`}
-                            title={
-                              canFilter
-                                ? "Hide everything YouTube keeps out of its Top listing. Its own Newest option calls that set potential spam, and it is where banned and held-for-review replies show up."
-                                : 'Load the whole thread first. Until then a comment missing from Top may simply be one the Top pass has not reached yet.'
-                            }
-                          >
-                            <span>Hide spam</span>
-                            <input
-                              type="checkbox"
-                              checked={hideFiltered}
-                              disabled={isBusy || !canFilter}
-                              onChange={() => {
-                                const next = !hideFiltered;
-                                hideFilteredRef.current = next;
-                                setHideFiltered(next);
-                                setVisibleCount(COMMENTS_PAGE_SIZE);
-                                void setHideFilteredComments(next);
-                                void refreshVisibleComments(COMMENTS_PAGE_SIZE);
-                              }}
-                            />
-                            <span className="switch-track" />
-                          </label>
-                          <p className="filter-count">
-                            {hideFiltered &&
-                            canFilter &&
-                            state.snapshot.filteredCount > 0
-                              ? `${state.snapshot.filteredCount.toLocaleString()} spam hidden`
-                              : ''}
-                          </p>
-                        </div>
-                      </div>
-                  </div>
-                  {threadError && <p className="thread-error">{threadError}</p>}
-
-                  <div className="comment-toolbar">
-                    <div className="toolbar-actions">
-                      <button
-                        type="button"
-                        className="toolbar-button"
-                        onClick={() => void exportComments('csv')}
-                        disabled={isLoadingAll || exportKind !== null}
-                        title="Download the loaded comments as a spreadsheet. Hide spam applies."
-                      >
-                        {exportKind === 'csv' ? 'Exporting…' : 'Export CSV'}
-                      </button>
-                      <button
-                        type="button"
-                        className="toolbar-button"
-                        onClick={() => void exportComments('pdf')}
-                        disabled={isLoadingAll || exportKind !== null}
-                        title="Download the loaded comments as a PDF. Hide spam applies."
-                      >
-                        {exportKind === 'pdf' ? 'Exporting…' : 'Export PDF'}
-                      </button>
-                      <button
-                        type="button"
-                        className="toolbar-button"
-                        onClick={handleLoadAll}
-                        disabled={isBusy}
-                      >
-                        {isLoadingAll ? 'Loading…' : 'Load all'}
-                      </button>
-                      <button
-                        type="button"
-                        className="toolbar-button"
-                        onClick={jumpToComments}
-                        disabled={isBusy}
-                      >
-                        Jump to page
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="comment-list" ref={listRef}>
-                    {visibleThreads.length === 0 && (
-                      <p className="comment-list-empty">
-                        YouTube is sending the thread in pages. Comments will
-                        appear here as they arrive.
-                      </p>
-                    )}
-                    {visibleThreads.map((thread) => {
-                      const expanded = expandedThreadIds.has(thread.parent.id);
-                      const canShowReplies = thread.replies.length > 0;
-
-                      return (
-                        <div className="comment-thread" key={thread.parent.id}>
-                          <CommentCard comment={thread.parent} />
-                          {canShowReplies && (
-                            <button
-                              type="button"
-                              className="replies-toggle"
-                              onClick={() => toggleThread(thread.parent.id)}
-                            >
-                              {expanded
-                                ? 'Hide replies'
-                                : `View ${repliesLabel(thread)}`}
-                            </button>
-                          )}
-                          {expanded && (
-                            <ReplyBranch nodes={thread.tree} depth={1} />
-                          )}
-                        </div>
-                      );
-                    })}
-                    {canLoadMore && (
-                      <div ref={sentinelRef} className="list-sentinel" />
-                    )}
-                  </div>
-                </section>
+                  <CommentsPane
+                    snapshot={state.snapshot}
+                    tabId={state.tabId}
+                    pageComments={pageComments}
+                    visibleCount={visibleCount}
+                    sortOrder={sortOrder}
+                    hideFiltered={hideFiltered}
+                    threadError={threadError}
+                    isLoadingAll={isLoadingAll}
+                    isBusy={isBusy}
+                    filterUnavailable={filterUnavailable}
+                    exportKind={exportKind}
+                    onSortChange={changeSortOrder}
+                    onToggleHideSpam={toggleHideSpam}
+                    onExport={(kind) => void exportComments(kind)}
+                    onLoadAll={handleLoadAll}
+                    onLoadMore={() => void loadMoreComments()}
+                    pageCanLoadMore={pageCanLoadMore}
+                  />
                 )}
               </>
             )}
@@ -1640,12 +2088,13 @@ function App() {
       </main>
 
       <footer>
-        <span>Fast summaries powered by Gemini</span>
+        <span>{copy.footerSummaries}</span>
         <span className="footer-dot">•</span>
-        <span>Ask the comments anything</span>
+        <span>{copy.footerAsk}</span>
       </footer>
       <ResizeHandle />
     </div>
+    </UiTextProvider>
   );
 }
 

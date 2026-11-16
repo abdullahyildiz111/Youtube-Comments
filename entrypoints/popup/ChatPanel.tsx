@@ -1,16 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ChatMessage } from '@/lib/chat-cache';
-
-const SUGGESTIONS = [
-  'What is the overall sentiment?',
-  'What are people complaining about?',
-  'What questions keep coming up?',
-];
+import { fill, languageName, useUiText } from '@/lib/ui-text';
 
 interface ChatPanelProps {
   disabled: boolean;
   disabledReason: string;
-  languageLabel: string;
   sending: boolean;
   error: string | null;
   messages: ChatMessage[];
@@ -21,13 +15,18 @@ interface ChatPanelProps {
 export function ChatPanel({
   disabled,
   disabledReason,
-  languageLabel,
   sending,
   error,
   messages,
   onSend,
   onClear,
 }: ChatPanelProps) {
+  const { language, copy } = useUiText();
+  const suggestions = [
+    copy.suggestionSentiment,
+    copy.suggestionComplaints,
+    copy.suggestionQuestions,
+  ];
   const [draft, setDraft] = useState('');
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -48,8 +47,8 @@ export function ChatPanel({
     <section className="chat-card">
       <div className="section-heading">
         <div>
-          <h2>Ask the comments</h2>
-          <p>Answers are in {languageLabel}</p>
+          <h2>{copy.askComments}</h2>
+          <p>{fill(copy.answersIn, { language: languageName(language, language) })}</p>
         </div>
         {messages.length > 0 && (
           <button
@@ -58,7 +57,7 @@ export function ChatPanel({
             disabled={sending}
             type="button"
           >
-            Clear
+            {copy.clear}
           </button>
         )}
       </div>
@@ -66,9 +65,9 @@ export function ChatPanel({
       <div className="chat-log" ref={listRef}>
         {messages.length === 0 && !sending && (
           <div className="chat-empty">
-            <p>Ask anything about this discussion.</p>
+            <p>{copy.askAnything}</p>
             <div className="chat-suggestions">
-              {SUGGESTIONS.map((suggestion) => (
+              {suggestions.map((suggestion) => (
                 <button
                   key={suggestion}
                   type="button"
@@ -94,7 +93,7 @@ export function ChatPanel({
 
         {sending && (
           <div className="chat-bubble chat-assistant chat-pending">
-            Reading the comments…
+            {copy.readingComments}
           </div>
         )}
       </div>
@@ -114,12 +113,12 @@ export function ChatPanel({
         <input
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
-          placeholder="Ask about these comments"
+          placeholder={copy.askPlaceholder}
           maxLength={800}
           disabled={disabled || sending}
         />
         <button type="submit" disabled={disabled || sending || !draft.trim()}>
-          Ask
+          {copy.ask}
         </button>
       </form>
     </section>

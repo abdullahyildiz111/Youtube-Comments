@@ -57,7 +57,9 @@ export const REPLY_LANGUAGES: readonly ReplyLanguage[] = REPLY_LANGUAGE_CODES.fl
     const label = labelFor(code);
     return label ? [{ code, label }] : [];
   },
-).sort((first, second) => first.label.localeCompare(second.label, 'en'));
+).sort((first, second) =>
+  first.label.localeCompare(second.label, 'en', { sensitivity: 'base' }),
+);
 
 const SUPPORTED_CODES = new Set(REPLY_LANGUAGES.map((language) => language.code));
 
