@@ -26,6 +26,8 @@ export const INNERTUBE_BRIDGE = {
 const PAGE_CONCURRENCY = 2;
 const REPLY_CONCURRENCY = 6;
 const RATE_LIMIT_ATTEMPTS = 12;
+const TOKEN_ATTEMPTS = 5;
+const STALE_CHAIN_PAGES = 3;
 
 // Captured before YouTube wraps fetch. A wrapped fetch applies the response
 // to the open comments section, so a Newest request would switch the page's
@@ -62,7 +64,6 @@ interface QueuedToken {
   // Set on top-level pages so every comment on the page can be given the
   // position YouTube gave it in that order.
   sort?: CommentSortOrder;
-  attempt?: number;
 }
 
 export type ContinuationFetcher = (
@@ -1674,8 +1675,11 @@ export async function fetchAllVideoComments(
   const queuedKeys = new Set<string>();
   const pageQueue: QueuedToken[] = [];
   const replyQueue: QueuedToken[] = [];
-  const topReplySeen = new Map<string, number>();
-  const topReplyCounted = new Set<string>();
+  // Pages already returned by each chain, so a chain that keeps handing out
+  // fresh tokens for comments it already served is stopped.
+  const chainSeenIds = new Map<string, Set<string>>();
+  const chainStalePages = new Map<string, number>();
+  let failedTokens = 0;
   let totalCommentsLabel: string | null = null;
   let gaveUp = false;
   let rateStrikes = 0;
@@ -1695,45 +1699,22 @@ export async function fetchAllVideoComments(
   // Top chain returns the moderated set and the Newest chain returns the same
   // thread plus whatever YouTube keeps out of it.
   const featuredIds = new Set<string>();
-  // Reply totals as the Top listing reports them, used to confirm we have the
-  // whole moderated thread before hiding anything from it.
+  // Reply totals as the Top listing's expand button reports them.
   const featuredReplyCounts = new Map<string, string>();
   const topReplyCursors = new Map<string, number>();
   const newestReplyCursors = new Map<string, number>();
   let topCursor = 0;
   let newestCursor = 0;
 
-  // Nested replies share the root id before the dot, and the button total
-  // counts them too. A cap stored on the root applies to every continuation
-  // of that thread, including "View reply" pages.
+  // Nested replies share the root id before the dot, so every continuation
+  // of a thread, including "View reply" pages, belongs to the root's chain.
   const replyRoot = (id: string | undefined): string => {
     if (!id) return '';
     return parentCommentId(id) || id;
   };
 
-  const topReplyCapped = (parentId: string | undefined): boolean => {
-    const root = replyRoot(parentId);
-    if (!root) return false;
-    const cap = parseCompactCount(featuredReplyCounts.get(root));
-    if (cap == null) return false;
-    return (topReplySeen.get(root) ?? 0) >= cap;
-  };
-
-  const noteTopReply = (id: string): void => {
-    if (!id || topReplyCounted.has(id)) return;
-    const root = parentCommentId(id);
-    if (!root) return;
-    topReplyCounted.add(id);
-    topReplySeen.set(root, (topReplySeen.get(root) ?? 0) + 1);
-  };
-
   const enqueue = (queue: QueuedToken[], next: QueuedToken | null): void => {
     if (!next?.token || next.token.length < 16) return;
-    // REMOVED: Early stopping based on cap check
-    // The cap check was stopping pagination too early because it counted
-    // entity batch replies that YouTube doesn't render, causing incomplete threads.
-    // Now we fetch all continuation tokens and let the UI filter instead.
-    // if (next.sort === 'top' && next.isReply && topReplyCapped(next.parentId)) return;
     const key = tokenChainKey(next);
     if (seenTokens.has(key) || queuedKeys.has(key)) return;
     queuedKeys.add(key);
@@ -1883,41 +1864,50 @@ export async function fetchAllVideoComments(
     if (wait > 0) await pauseCrawl(wait, stillHere);
     if (!stillHere() || gaveUp) return;
 
+    // A continuation that is dropped ends its whole chain: every later page
+    // of that listing or thread is only reachable through it. So a failure is
+    // retried, and one that keeps failing marks the crawl as truncated
+    // instead of passing a partial thread off as complete.
     let data: unknown;
-    try {
-      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      }
-      data = fetchPage
-        ? await fetchPage(next.token, next.clickTrackingParams, next.sort)
-        : await fetchInnertube(
-            getInnertubeContext(),
-            { continuation: next.token },
-            next.clickTrackingParams,
-            next.sort !== 'newest',
-          );
-    } catch (error) {
-      if (error instanceof InnertubeRateLimitError) {
-        // Several pages can fail together. Count that as one pause, or a
-        // short burst of 429s ends the crawl while comments are still arriving.
-        const alreadyPausing = pausedUntil > Date.now();
-        if (!alreadyPausing) {
-          rateStrikes += 1;
-          if (rateStrikes > RATE_LIMIT_ATTEMPTS) {
-            gaveUp = true;
-            return;
-          }
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+          await new Promise((resolve) => setTimeout(resolve, 0));
         }
-        const delay = Math.min(8_000, 1_000 * 2 ** Math.min(rateStrikes, 3));
-        pausedUntil = Math.max(pausedUntil, Date.now() + delay);
-        requeue(next);
-        await pauseCrawl(Math.max(0, pausedUntil - Date.now()), stillHere);
-        return;
+        data = fetchPage
+          ? await fetchPage(next.token, next.clickTrackingParams, next.sort)
+          : await fetchInnertube(
+              getInnertubeContext(),
+              { continuation: next.token },
+              next.clickTrackingParams,
+              next.sort !== 'newest',
+            );
+        break;
+      } catch (error) {
+        if (error instanceof InnertubeRateLimitError) {
+          // Several pages can fail together. Count that as one pause, or a
+          // short burst of 429s ends the crawl while comments are still arriving.
+          const alreadyPausing = pausedUntil > Date.now();
+          if (!alreadyPausing) {
+            rateStrikes += 1;
+            if (rateStrikes > RATE_LIMIT_ATTEMPTS) {
+              gaveUp = true;
+              return;
+            }
+          }
+          const delay = Math.min(8_000, 1_000 * 2 ** Math.min(rateStrikes, 3));
+          pausedUntil = Math.max(pausedUntil, Date.now() + delay);
+          requeue(next);
+          await pauseCrawl(Math.max(0, pausedUntil - Date.now()), stillHere);
+          return;
+        }
+        if (attempt + 1 >= TOKEN_ATTEMPTS) {
+          failedTokens += 1;
+          return;
+        }
+        await pauseCrawl(500 * 2 ** attempt, stillHere);
+        if (!stillHere() || gaveUp) return;
       }
-      if ((next.attempt ?? 0) < 1) {
-        requeue({ ...next, attempt: (next.attempt ?? 0) + 1 });
-      }
-      return;
     }
 
     if (!stillHere()) return;
@@ -1934,6 +1924,7 @@ export async function fetchAllVideoComments(
         !next.isReply && !totalCommentsLabel,
       );
     } catch {
+      failedTokens += 1;
       return;
     }
 
@@ -1969,18 +1960,19 @@ export async function fetchAllVideoComments(
       }
     }
 
-    if (next.sort === 'top') {
-      // Only replies YouTube actually listed. The entity batch on a reply
-      // page also carries comments the button does not count; counting those
-      // hits the cap early and the rest of the public thread never loads.
-      const pageRoot = next.isReply ? replyRoot(next.parentId) : '';
-      for (const id of parsed.orderedReplyIds) {
-        const root = parentCommentId(id);
-        if (!root) continue;
-        if (pageRoot && root !== pageRoot) continue;
-        noteTopReply(id);
-      }
+    const chain = next.isReply
+      ? `${next.sort ?? ''}|${replyRoot(next.parentId) || next.token}`
+      : `${next.sort ?? ''}|page`;
+    const chainIds = chainSeenIds.get(chain) ?? new Set<string>();
+    chainSeenIds.set(chain, chainIds);
+    let fresh = 0;
+    for (const comment of parsed.comments) {
+      if (chainIds.has(comment.id)) continue;
+      chainIds.add(comment.id);
+      fresh += 1;
     }
+    const stale = fresh === 0 ? (chainStalePages.get(chain) ?? 0) + 1 : 0;
+    chainStalePages.set(chain, stale);
 
     const added: YouTubeComment[] = [];
     const patches: CommentPatch[] = [];
@@ -1999,13 +1991,15 @@ export async function fetchAllVideoComments(
       added.push(materialize(comment, state));
     }
 
-    // REMOVED: stopTopReplies cap check - was causing incomplete reply fetching
-    // Fetch all continuation tokens for complete threads
-    // Nested "View reply" continuations sit inside this page's button total,
-    // so they are walked before the next page of the same thread.
-    const continuations = next.isReply
-      ? [...parsed.replyTokens, ...parsed.pageTokens]
-      : [...parsed.pageTokens, ...parsed.replyTokens];
+    // Nested "View reply" continuations are walked before the next page of
+    // the same thread. A chain that keeps answering with nothing new is not
+    // followed any further.
+    const continuations =
+      stale >= STALE_CHAIN_PAGES
+        ? []
+        : next.isReply
+          ? [...parsed.replyTokens, ...parsed.pageTokens]
+          : [...parsed.pageTokens, ...parsed.replyTokens];
     for (const token of continuations) {
       const tagged = next.sort ? { ...token, sort: next.sort } : token;
       enqueue(tagged.isReply ? replyQueue : pageQueue, tagged);
@@ -2083,8 +2077,6 @@ export async function fetchAllVideoComments(
       if (index === -1) break;
       const next = take(replyQueue, index);
       if (!next) break;
-      // REMOVED: Cap check - was stopping pagination too early
-      // if (next.sort === 'top' && next.isReply && topReplyCapped(next.parentId)) continue;
       startToken(next, 'reply');
     }
   };
@@ -2102,7 +2094,12 @@ export async function fetchAllVideoComments(
   const hitFuse = held.size >= commentCap || pages >= CRAWL_PAGE_FUSE;
   return {
     count: held.size,
-    truncated: gaveUp || hitFuse || pageQueue.length > 0 || replyQueue.length > 0,
+    truncated:
+      gaveUp ||
+      hitFuse ||
+      failedTokens > 0 ||
+      pageQueue.length > 0 ||
+      replyQueue.length > 0,
     totalCommentsLabel,
   };
 }
