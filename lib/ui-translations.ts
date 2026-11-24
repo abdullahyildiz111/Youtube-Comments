@@ -177,7 +177,7 @@ export const UI_PACKS: Record<string, Pack> = {
       loadWithoutScrollingHint: 'Eklenti, yorumların sayfada görünmesini beklemeden YouTube’dan yorum dizisini isteyebilir.',
       stoppedAt: '{count} yorumda durdu',
       updatedAt: '{time} güncellendi',
-      hideSpamTitle: 'YouTube’un En iyi listesinde tutmadığı her şeyi gizle. En yeni seçeneği buna olası spam der.',
+      hideSpamTitle: 'Bir dizide YouTube’un En iyi görünümünde göstermediği yanıtları gizle; böylece her dizi YouTube’un gösterdiği yanıt sayısıyla eşleşir. Üst düzey yorumlar her zaman kalır.',
       hideSpamUnavailable: 'Önce tüm diziyi yükleyin. O zamana kadar En iyi listede olmayan bir yorum henüz ulaşılmamış olabilir.',
       exportCsvTitle: 'Yüklenen yorumları tablo olarak indir. Spam gizleme uygulanır.',
       exportPdfTitle: 'Yüklenen yorumları PDF olarak indir. Spam gizleme uygulanır.',

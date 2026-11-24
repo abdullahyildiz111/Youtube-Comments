@@ -217,7 +217,7 @@ const EN: UiCopy = {
   updatesAsLoad: 'Updates as comments load',
   hideSpam: 'Hide spam',
   hideSpamTitle:
-    'Hide everything YouTube keeps out of its Top listing. Its own Newest option calls that set potential spam, and it is where banned and held-for-review replies show up.',
+    'Hide the replies YouTube’s Top view leaves out of a thread, so each thread matches the reply count YouTube shows. Top-level comments always stay.',
   hideSpamUnavailable:
     'Load the whole thread first. Until then a comment missing from Top may simply be one the Top pass has not reached yet.',
   spamHidden: '{count} spam hidden',
