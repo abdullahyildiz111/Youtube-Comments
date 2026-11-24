@@ -1729,7 +1729,11 @@ export async function fetchAllVideoComments(
 
   const enqueue = (queue: QueuedToken[], next: QueuedToken | null): void => {
     if (!next?.token || next.token.length < 16) return;
-    if (next.sort === 'top' && next.isReply && topReplyCapped(next.parentId)) return;
+    // REMOVED: Early stopping based on cap check
+    // The cap check was stopping pagination too early because it counted
+    // entity batch replies that YouTube doesn't render, causing incomplete threads.
+    // Now we fetch all continuation tokens and let the UI filter instead.
+    // if (next.sort === 'top' && next.isReply && topReplyCapped(next.parentId)) return;
     const key = tokenChainKey(next);
     if (seenTokens.has(key) || queuedKeys.has(key)) return;
     queuedKeys.add(key);
@@ -1995,13 +1999,13 @@ export async function fetchAllVideoComments(
       added.push(materialize(comment, state));
     }
 
-    const stopTopReplies =
-      next.sort === 'top' && next.isReply && topReplyCapped(next.parentId);
+    // REMOVED: stopTopReplies cap check - was causing incomplete reply fetching
+    // Fetch all continuation tokens for complete threads
     // Nested "View reply" continuations sit inside this page's button total,
     // so they are walked before the next page of the same thread.
     const continuations = next.isReply
-      ? [...parsed.replyTokens, ...(stopTopReplies ? [] : parsed.pageTokens)]
-      : [...(stopTopReplies ? [] : parsed.pageTokens), ...parsed.replyTokens];
+      ? [...parsed.replyTokens, ...parsed.pageTokens]
+      : [...parsed.pageTokens, ...parsed.replyTokens];
     for (const token of continuations) {
       const tagged = next.sort ? { ...token, sort: next.sort } : token;
       enqueue(tagged.isReply ? replyQueue : pageQueue, tagged);
@@ -2079,7 +2083,8 @@ export async function fetchAllVideoComments(
       if (index === -1) break;
       const next = take(replyQueue, index);
       if (!next) break;
-      if (next.sort === 'top' && next.isReply && topReplyCapped(next.parentId)) continue;
+      // REMOVED: Cap check - was stopping pagination too early
+      // if (next.sort === 'top' && next.isReply && topReplyCapped(next.parentId)) continue;
       startToken(next, 'reply');
     }
   };
