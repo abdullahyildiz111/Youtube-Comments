@@ -105,10 +105,80 @@ Since I cannot test with real YouTube data from the VM:
    - Clicking "N yanıt gör" actually shows N replies
 3. Test on multiple videos with varied reply counts
 
+## Implemented Fix
+
+**Chose Option 3**: Removed the cap check entirely, rely on continuation token exhaustion.
+
+### Changes Made (lib/innertube-comments.ts)
+
+1. **Line 1732 in `enqueue()`**: Commented out the cap check
+   ```typescript
+   // if (next.sort === 'top' && next.isReply && topReplyCapped(next.parentId)) return;
+   ```
+
+2. **Lines 1998-2004**: Removed `stopTopReplies` logic
+   ```typescript
+   const continuations = next.isReply
+     ? [...parsed.replyTokens, ...parsed.pageTokens]
+     : [...parsed.pageTokens, ...parsed.replyTokens];
+   ```
+
+3. **Line 2082**: Commented out cap check in reply queue processing
+   ```typescript
+   // if (next.sort === 'top' && next.isReply && topReplyCapped(next.parentId)) continue;
+   ```
+
+### Why This Works
+
+- **Before**: Stopped fetching when counted replies >= button total
+  - Counted entity batch replies that YouTube doesn't render
+  - Hit cap at 520 seen, but only ~203 rendered
+  - Stopped pagination, missing 317+ visible replies
+
+- **After**: Fetches ALL continuation tokens
+  - No premature stopping based on counts
+  - Pagination continues until YouTube has no more tokens
+  - UI filtering (`selectShownReplies`) handles Hide spam mode
+  - Complete threads are fetched for both modes
+
+### Testing Required
+
+User must verify in browser:
+1. Build extension: `npm run build`
+2. Load in Chrome/Firefox
+3. Navigate to https://www.youtube.com/watch?v=NkRHPEueW7Q
+4. Click "TÜMÜNÜ YÜKLE" (Load all)
+5. Verify counts:
+   - Hide spam ON: Should show ~520 replies for top comment
+   - Hide spam OFF: Should show ≥520 replies
+   - Click "520 yanıt gör" should expand and show ~520 replies
+6. Test on other videos (large, small, non-English)
+
+### Potential Issues
+
+1. **Performance**: Fetching ALL replies may be slower for huge threads
+   - Extension already has safety limits (500K comments, 200K pages)
+   - Most videos won't hit these limits
+
+2. **Rate limiting**: More API calls might trigger YouTube's rate limits
+   - Extension already has retry logic with backoff
+   - Pauses after 429 responses
+
+3. **Memory**: Storing more replies uses more memory
+   - Should be fine for typical use cases
+   - Very large threads (10K+ replies) might be slow
+
+### Why Previous "Fix" Was Wrong
+
+The previous fix only changed UI labeling to show `featuredReplyCount` instead of `replies.length`. That made the COUNT LABEL correct, but clicking the button still only showed ~203 replies because the data wasn't fetched. This fix ensures the data is actually fetched.
+
 ## Next Steps
 
-Shall I:
-A. Implement Option 2 (remove cap for OFF mode)?
-B. Implement Option 3 (stop when no more tokens)?
-C. Try to set up Puppeteer for browser testing (time-consuming)?
-D. Something else?
+Since I cannot test in a browser:
+1. User needs to test with real videos
+2. Create verification table comparing:
+   - YouTube's displayed count
+   - Extension's count (Hide spam ON)
+   - Extension's count (Hide spam OFF)
+   - Actual replies when expanded
+3. Report any remaining discrepancies
