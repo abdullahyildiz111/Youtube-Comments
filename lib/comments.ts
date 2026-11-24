@@ -104,13 +104,13 @@ export interface YouTubeComment {
   // display order with a depth on each entry, so the nesting is rebuilt from
   // the two together. A top-level comment is 0.
   replyLevel?: number;
-  // True when the comment came back through YouTube's "Top" listing, which is
-  // its moderated set. Replies reached through "Newest" only are the ones
-  // YouTube describes as "including potential spam" - banned and held-for-
-  // review comments arrive on that path and on no other.
+  // True when the comment came back through YouTube's "Top" listing. Inside
+  // a thread Top serves fewer replies than Newest, and the reply button
+  // counts only Top's set. Held-for-review and removed comments are served
+  // by neither listing.
   featured?: boolean;
-  // The reply count YouTube reports in its Top listing, which excludes banned
-  // and held replies. Only set on top-level comments the Top listing served.
+  // The reply count YouTube reports in its Top listing. Only set on
+  // top-level comments the Top listing served.
   featuredReplyCount?: string | null;
 }
 
