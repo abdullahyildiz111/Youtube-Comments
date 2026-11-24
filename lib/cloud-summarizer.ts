@@ -2,6 +2,31 @@ import type { YouTubeComment } from '@/lib/comments';
 
 const LOCAL_API_ORIGIN = 'http://localhost:3000';
 const REQUEST_TIMEOUT_MS = 480_000;
+const MAX_REQUEST_TIMEOUT_MS = 1_200_000;
+
+function modelTimeoutMs(commentCount: number): number {
+  // A long thread is summarized in many Gemini calls, and a busy free tier
+  // waits out its per-minute quota instead of failing the whole summary.
+  return Math.min(
+    MAX_REQUEST_TIMEOUT_MS,
+    Math.max(REQUEST_TIMEOUT_MS, 180_000 + commentCount * 80),
+  );
+}
+
+export const SUMMARY_UPLOAD_MESSAGE = 'comment-catcher:summary-upload' as const;
+
+export interface SummaryUploadMessage {
+  type: typeof SUMMARY_UPLOAD_MESSAGE;
+  phase: 'begin' | 'chunk' | 'finish';
+  uploadId: string;
+  kind: 'summary' | 'chat';
+  videoId?: string;
+  videoTitle?: string;
+  language?: string;
+  question?: string;
+  history?: ChatTurn[];
+  comments?: Array<{ text: string; isReply: boolean }>;
+}
 
 export const SUMMARIZE_MESSAGE = 'comment-catcher:summarize' as const;
 export const CHAT_MESSAGE = 'comment-catcher:chat' as const;
@@ -121,7 +146,7 @@ export async function performSummaryFetch(
   const controller = new AbortController();
   const timeout = globalThis.setTimeout(
     () => controller.abort(),
-    REQUEST_TIMEOUT_MS,
+    modelTimeoutMs(comments.length),
   );
 
   try {
@@ -167,6 +192,81 @@ export async function performSummaryFetch(
   } finally {
     globalThis.clearTimeout(timeout);
   }
+}
+
+export async function uploadCommentsForModel(options: {
+  kind: 'summary' | 'chat';
+  videoId: string;
+  videoTitle: string;
+  language: string;
+  comments: YouTubeComment[];
+  question?: string;
+  history?: ChatTurn[];
+  yieldBetween?: () => Promise<void>;
+}): Promise<CloudSummary | CloudChatAnswer> {
+  const uploadId = crypto.randomUUID();
+  const fail = (response: { ok?: boolean; errorMessage?: string; errorName?: string; status?: number } | undefined, fallback: string): never => {
+    if (response?.errorName === 'SummaryBackendNotConfiguredError') {
+      throw new SummaryBackendNotConfiguredError();
+    }
+    if (typeof response?.status === 'number') {
+      throw new CloudSummaryRequestError(response.status, response.errorMessage || fallback);
+    }
+    if (response?.errorName === 'AbortError') {
+      throw new DOMException(response.errorMessage || fallback, 'AbortError');
+    }
+    throw new Error(response?.errorMessage || fallback);
+  };
+
+  const begin = (await browser.runtime.sendMessage({
+    type: SUMMARY_UPLOAD_MESSAGE,
+    phase: 'begin',
+    uploadId,
+    kind: options.kind,
+    videoId: options.videoId,
+    videoTitle: options.videoTitle,
+    language: options.language,
+    question: options.question,
+    history: options.history,
+  })) as { ok?: boolean; errorMessage?: string; errorName?: string; status?: number } | undefined;
+  if (!begin?.ok) fail(begin, 'The summary backend could not be reached.');
+
+  for (let index = 0; index < options.comments.length; index += 400) {
+    const comments = options.comments.slice(index, index + 400).map((comment) => ({
+      text: comment.text,
+      isReply: comment.isReply,
+    }));
+    const chunk = (await browser.runtime.sendMessage({
+      type: SUMMARY_UPLOAD_MESSAGE,
+      phase: 'chunk',
+      uploadId,
+      kind: options.kind,
+      comments,
+    })) as { ok?: boolean; errorMessage?: string; errorName?: string; status?: number } | undefined;
+    if (!chunk?.ok) fail(chunk, 'The summary backend could not be reached.');
+    if (options.yieldBetween) await options.yieldBetween();
+  }
+
+  const finished = (await browser.runtime.sendMessage({
+    type: SUMMARY_UPLOAD_MESSAGE,
+    phase: 'finish',
+    uploadId,
+    kind: options.kind,
+  })) as
+    | {
+        ok?: boolean;
+        summary?: CloudSummary;
+        answer?: CloudChatAnswer;
+        errorMessage?: string;
+        errorName?: string;
+        status?: number;
+      }
+    | undefined;
+  const ready = finished ?? { ok: false };
+  if (!ready.ok) fail(finished, 'The comments could not be summarized.');
+  if (options.kind === 'summary' && ready.summary) return ready.summary;
+  if (options.kind === 'chat' && ready.answer) return ready.answer;
+  throw new Error('The summary service returned an invalid response.');
 }
 
 export async function summarizeCommentsInCloud(
@@ -243,7 +343,7 @@ export async function performChatFetch(
   const controller = new AbortController();
   const timeout = globalThis.setTimeout(
     () => controller.abort(),
-    REQUEST_TIMEOUT_MS,
+    modelTimeoutMs(comments.length),
   );
 
   try {
@@ -351,7 +451,10 @@ export function getCloudSummaryErrorMessage(error: unknown): string {
     }
 
     if (error.status === 429) {
-      return 'The free AI service is busy or rate-limited. Please wait a minute and try again.';
+      return (
+        error.message ||
+        'The free AI service is busy or rate-limited. Please wait a minute and try again.'
+      );
     }
 
     if (error.status === 413) {

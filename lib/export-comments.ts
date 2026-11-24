@@ -1,5 +1,4 @@
 import {
-  MAX_FETCHED_COMMENTS,
   type CommentNode,
   type CommentThread,
   type YouTubeComment,
@@ -74,7 +73,7 @@ export function commentExportFileName(
 
 function scopeLabel(meta: CommentExportMeta): string {
   if (meta.truncated) {
-    return `First ${MAX_FETCHED_COMMENTS.toLocaleString()} comments`;
+    return 'Stopped early';
   }
   if (meta.fetchedAll) return 'All loaded comments';
   return 'Comments captured so far';

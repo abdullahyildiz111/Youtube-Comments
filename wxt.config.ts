@@ -26,8 +26,12 @@ export default defineConfig({
     name: 'Comment Catcher for YouTube',
     description:
       'Collect YouTube comment threads and summarize them with Gemini.',
-    permissions: ['activeTab', 'storage'],
-    host_permissions: summaryHostPermissions(),
+    permissions: ['activeTab', 'storage', 'cookies', 'declarativeNetRequest'],
+    host_permissions: [
+      ...summaryHostPermissions(),
+      'https://www.youtube.com/*',
+      'https://*.youtube.com/*',
+    ],
     action: {
       default_title: 'Open Comment Catcher',
     },

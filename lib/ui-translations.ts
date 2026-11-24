@@ -205,6 +205,7 @@ export const UI_PACKS: Record<string, Pack> = {
       backendNotConfigured: 'Bulut özet hizmeti ayarlı değil. WXT_SUMMARY_API_URL değerini Coolify sunucunuza ayarlayıp eklentiyi yeniden derleyin.',
       backendRejected: 'Özet sunucusu bu eklentiyi reddetti. WXT_SUMMARY_API_TOKEN değerini kontrol edin.',
       rateLimited: 'Ücretsiz yapay zeka hizmeti meşgul veya sınırda. Bir dakika bekleyip tekrar deneyin.',
+      dailyQuota: 'Ücretsiz yapay zeka kotası bugünlük doldu. Yarın tekrar deneyin.',
       commentsTooLarge: 'Yakalanan yorumlar tek bir özet isteği için çok büyük.',
       cloudTooSlow: 'Bulut yapay zekası yanıt vermekte çok gecikti. Lütfen tekrar deneyin.',
       backendUnreachable: 'Özet sunucusuna ulaşılamadı. Adresini ve internet bağlantınızı kontrol edin.',

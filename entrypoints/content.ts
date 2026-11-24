@@ -1,6 +1,8 @@
+import { CommentOrder } from '@/lib/comment-index';
 import {
   COMMENT_MESSAGES,
-  MAX_FETCHED_COMMENTS,
+  CRAWL_MESSAGES,
+  MAX_COMMENT_PAGE_THREADS,
   MAX_SNAPSHOT_COMMENTS,
   type AutoSummarizePhase,
   type ChatAboutCommentsResponse,
@@ -14,29 +16,33 @@ import {
   type ScrollToCommentsResponse,
   type SearchCommentsResponse,
   type SummarizeLoadedResponse,
+  type CommentPatch,
   type CommentSortOrder,
   type YouTubeComment,
   DEFAULT_COMMENT_SORT_ORDER,
   canonicalYouTubeCommentId,
   flattenCommentThreads,
   getYouTubeVideoId,
-  groupCommentsForDisplay,
   isFeaturedByYouTube,
   makeCommentThread,
-  orderCommentsForDisplay,
+  pageReplyCount,
+  replyButtonCountFromText,
+  selectShownReplies,
   threadParentId,
   toCommentSortOrder,
 } from '@/lib/comments';
 import {
   INNERTUBE_BRIDGE,
   type CommentCountResult,
+  type InnertubeSession,
   type LoadAllProgress,
   type LoadAllResult,
 } from '@/lib/innertube-comments';
 import {
   getCloudSummaryErrorMessage,
-  summarizeCommentsInCloud,
-  askCommentsInCloud,
+  uploadCommentsForModel,
+  type CloudChatAnswer,
+  type CloudSummary,
 } from '@/lib/cloud-summarizer';
 import { isReplyLanguageCode } from '@/lib/languages';
 import {
@@ -65,53 +71,147 @@ function normalizeText(value: string | null | undefined): string {
   return value?.replace(/\s+/g, ' ').trim() ?? '';
 }
 
-// "50 yanıt", "50 replies", "1.2K replies" — the word changes with the UI
-// language, the number is what YouTube's reply button is showing.
-function leadingCount(value: string | null | undefined): string | null {
-  const match = normalizeText(value).match(/^(\d[\d.,]*)\s*([KMB])?(?:\s|$)/i);
-  if (!match?.[1]) return null;
-  if (match[2]) return `${match[1].replace(/[^\d]/g, '')}${match[2].toUpperCase()}`;
-  const digits = match[1].replace(/[^\d]/g, '');
-  return digits ? String(Number(digits)) : null;
+// YouTube draws the reply total inside an open shadow root (yt-button-shape).
+// textContent on the light-DOM host does not include that label.
+function accessibleText(root: Element): string {
+  const parts: string[] = [];
+  const visit = (node: Node) => {
+    if (node instanceof Element) {
+      const label = node.getAttribute('aria-label');
+      if (label) parts.push(label);
+      if (node.shadowRoot) {
+        for (const child of node.shadowRoot.childNodes) visit(child);
+      }
+    } else if (node.nodeType === Node.TEXT_NODE && node.textContent) {
+      parts.push(node.textContent);
+    }
+    if (node instanceof Element || node instanceof ShadowRoot) {
+      for (const child of node.childNodes) visit(child);
+    }
+  };
+  visit(root);
+  return normalizeText(parts.join(' '));
 }
 
-function countNumber(value: string | null | undefined): number | null {
-  const count = leadingCount(value);
-  if (!count) return null;
-  const match = count.match(/^(\d+)([KMB])?$/i);
-  if (!match?.[1]) return null;
-  const amount = Number(match[1]);
-  if (!Number.isFinite(amount)) return null;
-  const suffix = (match[2] || '').toUpperCase();
-  const scale =
-    suffix === 'K' ? 1_000 : suffix === 'M' ? 1_000_000 : suffix === 'B' ? 1_000_000_000 : 1;
-  return amount * scale;
+function queryDeep(root: ParentNode, selector: string): Element[] {
+  const found: Element[] = [];
+  const visit = (node: ParentNode) => {
+    node.querySelectorAll(selector).forEach((element) => found.push(element));
+    node.querySelectorAll('*').forEach((element) => {
+      if (element.shadowRoot) visit(element.shadowRoot);
+    });
+  };
+  visit(root);
+  return found;
+}
+
+function shadowHost(node: Node): Element | null {
+  const root = node.getRootNode();
+  return root instanceof ShadowRoot ? root.host : null;
+}
+
+// closest() stops at a shadow root, and the reply expander is not a direct
+// child of the thread. Walk the real tree so a nested reply's own button is
+// not read as the thread total.
+function enclosingReplies(element: Element, thread: Element): Element | null {
+  let node: Node | null = element;
+  while (node && node !== thread) {
+    if (
+      node instanceof Element &&
+      (node.matches('ytd-comment-replies-renderer') || node.id === 'replies')
+    ) {
+      return node;
+    }
+    const host = shadowHost(node);
+    node = host && host !== node ? host : node.parentNode;
+  }
+  return null;
+}
+
+function insideNestedReply(element: Element): boolean {
+  let node: Node | null = element;
+  let crossedReplyBody = false;
+  while (node) {
+    if (node instanceof Element) {
+      if (node.matches('ytd-comment-thread-renderer')) return false;
+      if (node.matches('ytd-comment-view-model, ytd-comment-renderer')) {
+        crossedReplyBody = true;
+      }
+      if (
+        crossedReplyBody &&
+        (node.matches('ytd-comment-replies-renderer') || node.id === 'replies')
+      ) {
+        return true;
+      }
+    }
+    const host = shadowHost(node);
+    node = host && host !== node ? host : node.parentNode;
+  }
+  return false;
+}
+
+function commentIdFromThread(thread: Element): string | null {
+  const owned = (element: Element) => !enclosingReplies(element, thread);
+  for (const link of queryDeep(thread, 'a[href*="lc="]')) {
+    if (!owned(link)) continue;
+    const href = link.getAttribute('href');
+    if (!href) continue;
+    try {
+      const id = canonicalDomCommentId(
+        new URL(href, window.location.origin).searchParams.get('lc'),
+      );
+      if (id) return id;
+    } catch {
+      // A malformed permalink is skipped; the next link may still be valid.
+    }
+  }
+  for (const node of queryDeep(thread, '[comment-id], [data-comment-id]')) {
+    if (!owned(node)) continue;
+    const id = canonicalDomCommentId(
+      node.getAttribute('comment-id') || node.getAttribute('data-comment-id'),
+    );
+    if (id) return id;
+  }
+  return null;
 }
 
 function visibleReplyCount(thread: Element): string | null {
-  const more = thread.querySelector(
-    ':scope > ytd-comment-replies-renderer #more-replies, :scope > #replies #more-replies, :scope ytd-comment-replies-renderer #more-replies',
-  );
-  const fromButton =
-    leadingCount(more?.textContent) ||
-    leadingCount(more?.getAttribute('aria-label'));
-  if (fromButton) return fromButton;
+  let best = 0;
+  let bestLabel: string | null = null;
+  const consider = (host: Element, allowBare: boolean) => {
+    // A nested reply has its own expander. The thread total is the button
+    // on the thread itself.
+    if (insideNestedReply(host)) return;
+    const count = replyButtonCountFromText(accessibleText(host), allowBare);
+    const value = pageReplyCount(count);
+    if (value == null || value <= best) return;
+    best = value;
+    bestLabel = count;
+  };
 
-  for (const button of thread.querySelectorAll('button')) {
-    if (
-      button.closest(
-        'ytd-comment-replies-renderer ytd-comment-view-model, ytd-comment-replies-renderer ytd-comment-renderer',
-      )
-    ) {
-      continue;
-    }
-    const text = normalizeText(button.textContent);
-    if (!/^\d[\d.,]*\s*(?:[KMB]\s+)?\p{L}/u.test(text)) continue;
-    const count = leadingCount(text);
-    if (count) return count;
+  // The expander YouTube draws under the comment is the total Hide spam
+  // must match. A later, larger control must not replace it.
+  const repliesRoot =
+    thread.querySelector('ytd-comment-replies-renderer, #replies') ?? thread;
+  for (const host of queryDeep(repliesRoot, '#more-replies, #more-replies-button')) {
+    consider(host, true);
   }
+  if (bestLabel) return bestLabel;
 
-  return null;
+  for (const host of queryDeep(
+    repliesRoot,
+    'button, ytd-button-renderer, button-view-model, yt-button-shape',
+  )) {
+    consider(host, false);
+  }
+  if (bestLabel) return bestLabel;
+
+  // innerText still contains "229 yanıt" when the expander's nodes sit in a
+  // shadow root this walk did not reach. The like count beside Reply is not
+  // a reply total; replyButtonCountFromText leaves that pair out.
+  const fallbackText = thread instanceof HTMLElement ? thread.innerText : thread.textContent;
+  const fallback = replyButtonCountFromText(fallbackText, false);
+  return pageReplyCount(fallback) != null ? fallback : null;
 }
 
 function readText(root: ParentNode, selectors: string[]): string {
@@ -228,6 +328,7 @@ export default defineContentScript({
     let autoTimer: number | undefined;
     let loadGeneration = 0;
     let loadAllInFlight: Promise<LoadAllCommentsResponse> | null = null;
+    let activeCrawlRequestId = '';
     let loadAllForVideoId: string | null = null;
     let loadAllStartedAt = 0;
     let hiddenAt = 0;
@@ -236,7 +337,8 @@ export default defineContentScript({
     let scanTimeout: number | undefined;
     let fallbackId = 0;
     let lastPublishedSignature = '';
-    let visibleReplyStamp = '';
+    let replyStamp = 0;
+    let publishTimer: number | undefined;
     // The order the popup is showing. YouTube resets to "Top" on every video,
     // so this does too.
     let sortOrder: CommentSortOrder = DEFAULT_COMMENT_SORT_ORDER;
@@ -249,6 +351,12 @@ export default defineContentScript({
     let searchMatches: { key: string; ids: string[] } | null = null;
 
     const comments = new Map<string, YouTubeComment>();
+    // Reply totals read off the watch page. The crawl must not replace them
+    // with the toolbar total, which counts a different set of replies.
+    const pageReplyCounts = new Set<string>();
+    const order = new CommentOrder();
+    let rootCache: { key: string; ids: string[] } | null = null;
+    let filterCache: { key: string; count: number } | null = null;
     let fallbackIds = new WeakMap<Element, string>();
     let scheduleAutoSummarize = () => {};
 
@@ -353,80 +461,207 @@ export default defineContentScript({
       };
     };
 
-    const allThreads = (order: CommentSortOrder = sortOrder) =>
-      groupCommentsForDisplay(Array.from(comments.values()), order);
+    const remember = (comment: YouTubeComment, fromPage = false) => {
+      const previous = comments.get(comment.id);
+      if (!previous) {
+        comments.set(comment.id, comment);
+      } else {
+        // The watch-page button is the total Hide spam must match. A later
+        // crawl payload must not wipe it, and a toolbar-sized total must not
+        // replace a smaller button once the page has been read.
+        // A page total locks out a later toolbar-sized count. A lock with no
+        // number yet must not freeze the thread at "unknown" and hide the
+        // real button total when it arrives.
+        const locked =
+          pageReplyCounts.has(previous.id) &&
+          !fromPage &&
+          pageReplyCount(previous.featuredReplyCount) != null;
+        const prevTotal = pageReplyCount(previous.featuredReplyCount);
+        const nextTotal = pageReplyCount(comment.featuredReplyCount);
+        let featuredReplyCount = previous.featuredReplyCount ?? null;
+        if (fromPage) {
+          featuredReplyCount = comment.featuredReplyCount ?? previous.featuredReplyCount ?? null;
+        } else if (!locked && (prevTotal == null || (nextTotal != null && nextTotal > prevTotal))) {
+          featuredReplyCount = comment.featuredReplyCount ?? previous.featuredReplyCount ?? null;
+        }
+        comments.set(comment.id, {
+          ...previous,
+          ...comment,
+          parentId: comment.parentId || previous.parentId,
+          isReply: previous.isReply || comment.isReply,
+          featured: Boolean(previous.featured || comment.featured),
+          featuredReplyCount,
+          topRank: comment.topRank ?? previous.topRank,
+          newestRank: comment.newestRank ?? previous.newestRank,
+          replyRank: comment.replyRank ?? previous.replyRank,
+          replyToId: comment.replyToId || previous.replyToId,
+          likeCount: comment.likeCount ?? previous.likeCount,
+          replyCount: comment.replyCount ?? previous.replyCount,
+          isPinned: previous.isPinned || comment.isPinned,
+          pinnedLabel: comment.pinnedLabel || previous.pinnedLabel,
+          isCreatorHearted: previous.isCreatorHearted || comment.isCreatorHearted,
+          isVerified: previous.isVerified || comment.isVerified,
+          isChannelOwner: previous.isChannelOwner || comment.isChannelOwner,
+        });
+      }
+      const stored = comments.get(comment.id);
+      if (stored) order.note(stored);
+      rootCache = null;
+      filterCache = null;
+    };
+
+    // Copies the reply totals currently drawn under each visible thread.
+    // The comment renderer is nested inside #comment-container, so a direct
+    // child lookup never saw the button and Hide spam kept the featured set
+    // instead of the number on the page.
+    const refreshPageReplyCounts = (): boolean => {
+      const root = document.querySelector(COMMENTS_ROOT_SELECTOR);
+      if (!root) return false;
+      let changed = false;
+      for (const thread of root.querySelectorAll('ytd-comment-thread-renderer')) {
+        const count = visibleReplyCount(thread);
+        let id = commentIdFromThread(thread);
+        if (!count || !id) continue;
+        let existing = comments.get(id);
+        if (existing?.isReply) {
+          const rootId = threadParentId(existing);
+          id = rootId;
+          existing = rootId ? comments.get(rootId) : undefined;
+        }
+        if (!existing || existing.isReply || !id) continue;
+        pageReplyCounts.add(existing.id);
+        if (pageReplyCount(existing.featuredReplyCount) === pageReplyCount(count)) continue;
+        remember({ ...existing, featuredReplyCount: count }, true);
+        replyStamp += 1;
+        changed = true;
+      }
+      return changed;
+    };
+
+    const applyPatch = (patch: CommentPatch) => {
+      const existing = comments.get(patch.id);
+      if (!existing) return;
+      remember({
+        ...existing,
+        topRank: 'topRank' in patch ? patch.topRank : existing.topRank,
+        newestRank: 'newestRank' in patch ? patch.newestRank : existing.newestRank,
+        replyRank: 'replyRank' in patch ? patch.replyRank : existing.replyRank,
+        featured: 'featured' in patch ? patch.featured : existing.featured,
+        replyToId: 'replyToId' in patch ? patch.replyToId : existing.replyToId,
+        isPinned: 'isPinned' in patch ? Boolean(patch.isPinned) : existing.isPinned,
+        pinnedLabel: 'pinnedLabel' in patch ? patch.pinnedLabel : existing.pinnedLabel,
+        likeCount: 'likeCount' in patch ? patch.likeCount ?? null : existing.likeCount,
+        // Toolbar replyCount includes replies the watch-page button leaves out.
+        // The button total stays in featuredReplyCount and must not be replaced
+        // once the page has shown it.
+        replyCount:
+          'replyCount' in patch ? patch.replyCount ?? null : existing.replyCount,
+        featuredReplyCount:
+          pageReplyCounts.has(existing.id) &&
+          pageReplyCount(existing.featuredReplyCount) != null
+            ? existing.featuredReplyCount
+            : 'featuredReplyCount' in patch
+              ? patch.featuredReplyCount ?? existing.featuredReplyCount
+              : existing.featuredReplyCount,
+      });
+    };
+
+    const isIndexedRoot = (id: string) => {
+      const comment = comments.get(id);
+      return Boolean(comment && !comment.isReply);
+    };
 
     // A comment counts as unfeatured only once the whole thread has been
-    // walked. On a partial or capped load a missing Top listing just means the
-    // Top pass never reached it, so filtering is held back until then.
+    // walked. On a partial load a missing Top listing just means the Top pass
+    // has not reached it yet, so filtering is held back until then.
     const canFilterByRanking = () => fetchedAll && !truncated;
 
-    const filteredThreadCount = (order: CommentSortOrder = sortOrder) => {
-      if (!canFilterByRanking()) return 0;
+    // Hide spam keeps the replies behind YouTube's reply button. The rest are
+    // what Newest adds, and they stay in the thread until spam is hidden.
+    const withFeaturedReplies = (thread: CommentThread): CommentThread => {
+      const kept = selectShownReplies(
+        thread.replies,
+        pageReplyCount(thread.parent.featuredReplyCount),
+      );
+      if (kept === thread.replies) return thread;
+      return makeCommentThread(thread.parent, kept);
+    };
 
+    const orderedRootIds = () => {
+      const key = [
+        sortOrder,
+        hideFilteredComments,
+        comments.size,
+        capturedAt,
+        fetchedAll,
+        truncated,
+      ].join('|');
+      if (rootCache?.key === key) return rootCache.ids;
+      const ids = order.rootIds(sortOrder, isIndexedRoot).filter((id) => {
+        if (!hideFilteredComments || !canFilterByRanking()) return true;
+        const comment = comments.get(id);
+        return Boolean(comment && isFeaturedByYouTube(comment));
+      });
+      rootCache = { key, ids };
+      return ids;
+    };
+
+    const threadFor = (id: string): CommentThread | null => {
+      const parent = comments.get(id);
+      if (!parent || parent.isReply) return null;
+      const thread = makeCommentThread(parent, order.replies(parent.id, comments));
+      if (hideFilteredComments && canFilterByRanking()) return withFeaturedReplies(thread);
+      return thread;
+    };
+
+    const threadsFrom = (offset: number, limit: number): CommentThread[] => {
+      const end = offset + limit;
+      const ids =
+        hideFilteredComments && canFilterByRanking()
+          ? orderedRootIds().slice(offset, end)
+          : order.rootIds(sortOrder, isIndexedRoot, end).slice(offset);
+      const threads: CommentThread[] = [];
+      for (const id of ids) {
+        const thread = threadFor(id);
+        if (thread) threads.push(thread);
+      }
+      return threads;
+    };
+
+    const collectListedComments = async (): Promise<YouTubeComment[]> => {
+      const ids = orderedRootIds();
+      const listed: YouTubeComment[] = [];
+      for (let index = 0; index < ids.length; index += 1) {
+        const thread = threadFor(ids[index] ?? '');
+        if (!thread) continue;
+        listed.push(thread.parent, ...thread.replies);
+        if (index > 0 && index % 300 === 0) await yieldToUi();
+      }
+      return listed;
+    };
+
+    const filteredThreadCount = () => {
+      if (!canFilterByRanking()) return 0;
+      const key = `${comments.size}|${capturedAt}|${sortOrder}`;
+      if (filterCache?.key === key) return filterCache.count;
       let hidden = 0;
-      for (const thread of allThreads(order)) {
-        if (!isFeaturedByYouTube(thread.parent)) {
-          hidden += 1 + thread.replies.length;
+      for (const id of order.rootIds(sortOrder, isIndexedRoot)) {
+        const parent = comments.get(id);
+        if (!parent) continue;
+        const replies = order.replies(id, comments);
+        if (!isFeaturedByYouTube(parent)) {
+          hidden += 1 + replies.length;
           continue;
         }
-        hidden += thread.replies.length - withFeaturedReplies(thread).replies.length;
+        const kept = withFeaturedReplies(makeCommentThread(parent, replies));
+        hidden += replies.length - kept.replies.length;
       }
+      filterCache = { key, count: hidden };
       return hidden;
     };
 
-    // YouTube's reply button is already the moderated count. Newest adds the
-    // replies that button leaves out, so Hide spam shows the button's number
-    // and drops only those extra direct replies.
-    const withFeaturedReplies = (thread: CommentThread): CommentThread => {
-      const featured = thread.replies.filter((reply) => isFeaturedByYouTube(reply));
-      if (featured.length === 0) return thread;
-
-      const keptIds = new Set(featured.map((reply) => reply.id));
-      let grew = true;
-      while (grew) {
-        grew = false;
-        for (const reply of thread.replies) {
-          if (keptIds.has(reply.id)) continue;
-          if (reply.replyToId && keptIds.has(reply.replyToId)) {
-            keptIds.add(reply.id);
-            grew = true;
-          }
-        }
-      }
-
-      const kept = thread.replies.filter((reply) => keptIds.has(reply.id));
-      const pageCount = countNumber(thread.parent.featuredReplyCount);
-      const moderated =
-        pageCount != null && pageCount > 0 && pageCount < thread.replies.length
-          ? pageCount
-          : null;
-      if (kept.length === thread.replies.length && moderated == null) return thread;
-
-      return makeCommentThread(
-        { ...thread.parent, replyCount: String(moderated ?? kept.length) },
-        kept,
-      );
-    };
-
-    const listedThreads = (order: CommentSortOrder = sortOrder) => {
-      const threads = allThreads(order);
-      if (!hideFilteredComments || !canFilterByRanking()) return threads;
-
-      const featured = threads
-        .filter((thread) => isFeaturedByYouTube(thread.parent))
-        .map(withFeaturedReplies);
-
-      return featured.length > 0 ? featured : threads;
-    };
-
-    const listedComments = () =>
-      hideFilteredComments && canFilterByRanking()
-        ? flattenCommentThreads(listedThreads())
-        : orderCommentsForDisplay(Array.from(comments.values()), sortOrder);
-
     const getSnapshot = (): CommentsSnapshot => {
-      const threads = listedThreads();
+      const threads = threadsFrom(0, MAX_SNAPSHOT_COMMENTS);
       return {
         videoId: activeVideoId,
         videoTitle,
@@ -434,9 +669,12 @@ export default defineContentScript({
         pageUrl: window.location.href,
         totalCommentsLabel,
         status,
-        comments: flattenCommentThreads(threads.slice(0, MAX_SNAPSHOT_COMMENTS)),
+        comments: flattenCommentThreads(threads),
         capturedCount: comments.size,
-        threadCount: threads.length,
+        threadCount:
+          hideFilteredComments && canFilterByRanking()
+            ? orderedRootIds().length
+            : order.countRoots(),
         capturedAt,
         fetchedAll,
         truncated,
@@ -449,7 +687,7 @@ export default defineContentScript({
       };
     };
 
-    const publishUpdate = () => {
+    const publishUpdateNow = () => {
       const signature = [
         activeVideoId,
         status,
@@ -465,7 +703,7 @@ export default defineContentScript({
         autoError,
         sortOrder,
         hideFilteredComments,
-        visibleReplyStamp,
+        replyStamp,
       ].join('|');
 
       if (signature === lastPublishedSignature) return;
@@ -481,6 +719,22 @@ export default defineContentScript({
       void browser.runtime.sendMessage(message).catch(() => {
         // The popup is normally closed, so there may be no message receiver.
       });
+    };
+
+    const publishUpdate = () => {
+      if (status !== 'loading-all') {
+        if (publishTimer !== undefined) {
+          window.clearTimeout(publishTimer);
+          publishTimer = undefined;
+        }
+        publishUpdateNow();
+        return;
+      }
+      if (publishTimer !== undefined) return;
+      publishTimer = ctx.setTimeout(() => {
+        publishTimer = undefined;
+        publishUpdateNow();
+      }, 700);
     };
 
     const resetForVideo = (nextVideoId: string | null) => {
@@ -499,7 +753,21 @@ export default defineContentScript({
       loadGeneration += 1;
       sortOrder = DEFAULT_COMMENT_SORT_ORDER;
       hasFetchedRanks = false;
+      if (activeCrawlRequestId) {
+        void browser.runtime
+          .sendMessage({
+            type: CRAWL_MESSAGES.cancel,
+            requestId: activeCrawlRequestId,
+          })
+          .catch(() => undefined);
+        activeCrawlRequestId = '';
+      }
       comments.clear();
+      pageReplyCounts.clear();
+      order.reset();
+      rootCache = null;
+      filterCache = null;
+      replyStamp = 0;
       fallbackId = 0;
       fallbackIds = new WeakMap<Element, string>();
       lastPublishedSignature = '';
@@ -671,32 +939,13 @@ export default defineContentScript({
 
           const existingComment = comments.get(comment.id);
           if (!existingComment || !areCommentsEqual(existingComment, comment)) {
-            comments.set(comment.id, comment);
+            remember(comment);
             commentsChanged = true;
           }
         }
       }
 
-      const threads = commentsRoot.querySelectorAll('ytd-comment-thread-renderer');
-      for (const thread of threads) {
-        const renderer = thread.querySelector(
-          ':scope > ytd-comment-view-model, :scope > ytd-comment-renderer, :scope > #comment ytd-comment-renderer, :scope > #comment ytd-comment-view-model',
-        );
-        if (!renderer) continue;
-        const probed = extractComment(renderer, { order: 'top', root: null, reply: null });
-        if (!probed || probed.isReply) continue;
-        const count = visibleReplyCount(thread);
-        if (!count) continue;
-        const existing = comments.get(probed.id);
-        if (!existing || existing.isReply || existing.featuredReplyCount === count) continue;
-        comments.set(probed.id, { ...existing, featuredReplyCount: count });
-        commentsChanged = true;
-      }
-
-      visibleReplyStamp = [...comments.values()]
-        .filter((comment) => comment.featuredReplyCount && !comment.isReply)
-        .map((comment) => `${comment.id}:${comment.featuredReplyCount}`)
-        .join(',');
+      if (refreshPageReplyCounts()) commentsChanged = true;
 
       if (commentsChanged) {
         capturedAt = new Date().toISOString();
@@ -790,6 +1039,155 @@ export default defineContentScript({
       return getYouTubeVideoId(window.location.href) === videoId;
     };
 
+    const requestPageSession = (videoId: string) =>
+      new Promise<InnertubeSession>((resolve, reject) => {
+        const requestId = crypto.randomUUID();
+        const timer = window.setTimeout(() => {
+          window.removeEventListener('message', onMessage);
+          reject(new Error('YouTube client data is not ready. Refresh the video page.'));
+        }, 12_000);
+        const onMessage = (event: MessageEvent) => {
+          if (event.source !== window || event.origin !== window.location.origin) return;
+          const data = event.data as {
+            type?: string;
+            requestId?: string;
+            session?: InnertubeSession;
+            error?: string;
+          } | null;
+          if (!data || data.type !== INNERTUBE_BRIDGE.sessionResult || data.requestId !== requestId) {
+            return;
+          }
+          window.clearTimeout(timer);
+          window.removeEventListener('message', onMessage);
+          if (data.session) resolve(data.session);
+          else reject(new Error(data.error || 'YouTube client data is not ready.'));
+        };
+        window.addEventListener('message', onMessage);
+        window.postMessage(
+          { type: INNERTUBE_BRIDGE.sessionRequest, requestId, videoId },
+          window.location.origin,
+        );
+      });
+
+    const fetchRawFromPage = (
+      token: string,
+      clickTrackingParams?: string,
+      authorize = true,
+    ) =>
+      new Promise<{ body?: string; error?: string; rateLimited?: boolean }>((resolve) => {
+        const requestId = crypto.randomUUID();
+        const timer = window.setTimeout(() => {
+          window.removeEventListener('message', onMessage);
+          resolve({ error: 'The YouTube tab could not load the next comment page.' });
+        }, 25_000);
+        const onMessage = (event: MessageEvent) => {
+          if (event.source !== window || event.origin !== window.location.origin) return;
+          const data = event.data as {
+            type?: string;
+            requestId?: string;
+            body?: string;
+            error?: string;
+            rateLimited?: boolean;
+          } | null;
+          if (!data || data.type !== INNERTUBE_BRIDGE.rawResult || data.requestId !== requestId) {
+            return;
+          }
+          window.clearTimeout(timer);
+          window.removeEventListener('message', onMessage);
+          resolve({
+            body: typeof data.body === 'string' ? data.body : undefined,
+            error: typeof data.error === 'string' ? data.error : undefined,
+            rateLimited: data.rateLimited === true,
+          });
+        };
+        window.addEventListener('message', onMessage);
+        window.postMessage(
+          {
+            type: INNERTUBE_BRIDGE.rawFetch,
+            requestId,
+            token,
+            clickTrackingParams,
+            authorize,
+          },
+          window.location.origin,
+        );
+      });
+
+    const crawlFromBackground = async (
+      videoId: string,
+      generation: number,
+      session: InnertubeSession,
+    ): Promise<LoadAllCommentsResponse | null> => {
+      const requestId = crypto.randomUUID();
+      activeCrawlRequestId = requestId;
+      status = 'loading-all';
+      comments.clear();
+      pageReplyCounts.clear();
+      order.reset();
+      rootCache = null;
+      filterCache = null;
+      hasFetchedRanks = false;
+      fetchedAll = false;
+      truncated = false;
+      loadAllCount = 0;
+      capturedAt = null;
+      publishUpdateNow();
+
+      try {
+        const result = (await browser.runtime.sendMessage({
+          type: CRAWL_MESSAGES.start,
+          requestId,
+          videoId,
+          session,
+        })) as {
+          ok?: boolean;
+          count?: number;
+          truncated?: boolean;
+          totalCommentsLabel?: string | null;
+          error?: string;
+        } | undefined;
+
+        if (generation !== loadGeneration || activeVideoId !== videoId) {
+          return {
+            ok: false,
+            count: comments.size,
+            truncated: false,
+            error: 'The video changed before comments finished loading.',
+          };
+        }
+
+        if (!result?.ok && comments.size === 0) return null;
+
+        if (refreshPageReplyCounts()) capturedAt = new Date().toISOString();
+        hasFetchedRanks = comments.size > 0;
+        fetchedAll = true;
+        truncated = Boolean(result?.truncated || !result?.ok);
+        loadAllCount = null;
+        applyListedCommentCount(result?.totalCommentsLabel);
+        capturedAt = comments.size > 0 ? new Date().toISOString() : capturedAt;
+        status = comments.size > 0 ? 'ready' : 'no-comments';
+        publishUpdateNow();
+        return {
+          ok: comments.size > 0 || Boolean(result?.ok),
+          count: comments.size,
+          truncated,
+          error: result?.ok ? undefined : result?.error,
+        };
+      } catch {
+        if (comments.size > 0) {
+          fetchedAll = true;
+          truncated = true;
+          loadAllCount = null;
+          status = 'ready';
+          publishUpdateNow();
+          return { ok: true, count: comments.size, truncated: true };
+        }
+        return null;
+      } finally {
+        if (activeCrawlRequestId === requestId) activeCrawlRequestId = '';
+      }
+    };
+
     const requestAllComments = (): Promise<LoadAllCommentsResponse> => {
       if (loadAllInFlight && loadAllForVideoId === activeVideoId) {
         return loadAllInFlight;
@@ -819,6 +1217,12 @@ export default defineContentScript({
             truncated: false,
             error: 'The video changed before comments finished loading.',
           };
+        }
+
+        const session = await requestPageSession(videoId).catch(() => null);
+        if (session && generation === loadGeneration && activeVideoId === videoId) {
+          const background = await crawlFromBackground(videoId, generation, session);
+          if (background) return background;
         }
 
         return new Promise<LoadAllCommentsResponse>((resolve) => {
@@ -859,11 +1263,10 @@ export default defineContentScript({
               status = 'loading-all';
               loadAllCount = data.count;
               applyListedCommentCount(data.totalCommentsLabel);
-              if (data.comments?.length) {
+              if (data.comments?.length || data.patches?.length) {
                 hasFetchedRanks = true;
-                for (const comment of data.comments) {
-                  comments.set(comment.id, comment);
-                }
+                for (const comment of data.comments ?? []) remember(comment);
+                for (const patch of data.patches ?? []) applyPatch(patch);
                 capturedAt = new Date().toISOString();
               }
               publishUpdate();
@@ -885,12 +1288,17 @@ export default defineContentScript({
               return;
             }
 
-            comments.clear();
-            hasFetchedRanks = true;
-            for (const comment of data.comments) {
-              comments.set(comment.id, comment);
+            if (data.comments.length > 0) {
+              comments.clear();
+              pageReplyCounts.clear();
+              order.reset();
+              rootCache = null;
+              filterCache = null;
+              for (const comment of data.comments) remember(comment);
             }
+            hasFetchedRanks = true;
 
+            refreshPageReplyCounts();
             capturedAt = new Date().toISOString();
             fetchedAll = true;
             truncated = data.truncated;
@@ -930,11 +1338,15 @@ export default defineContentScript({
               truncated: false,
               error: 'Timed out while loading comments from YouTube.',
             });
-          }, 600_000);
+          }, 1_800_000);
 
           window.addEventListener('message', onPageMessage);
           status = 'loading-all';
           comments.clear();
+          pageReplyCounts.clear();
+          order.reset();
+          rootCache = null;
+          filterCache = null;
           loadAllCount = 0;
           fetchedAll = false;
           capturedAt = null;
@@ -989,12 +1401,14 @@ export default defineContentScript({
         : await getReplyLanguage();
 
       try {
-        const result = await summarizeCommentsInCloud(
-          listedComments(),
-          activeVideoId,
+        const result = (await uploadCommentsForModel({
+          kind: 'summary',
+          videoId: activeVideoId,
           videoTitle,
-          replyLanguage,
-        );
+          language: replyLanguage,
+          comments: await collectListedComments(),
+          yieldBetween: yieldToUi,
+        })) as CloudSummary;
         const summary = {
           videoId: activeVideoId,
           text: result.text,
@@ -1030,14 +1444,16 @@ export default defineContentScript({
         const replyLanguage = isReplyLanguageCode(language)
           ? language
           : await getReplyLanguage();
-        const result = await askCommentsInCloud(
-          listedComments(),
-          activeVideoId,
+        const result = (await uploadCommentsForModel({
+          kind: 'chat',
+          videoId: activeVideoId,
           videoTitle,
+          language: replyLanguage,
           question,
           history,
-          replyLanguage,
-        );
+          comments: await collectListedComments(),
+          yieldBetween: yieldToUi,
+        })) as CloudChatAnswer;
         return { ok: true, answer: result.text };
       } catch (error: unknown) {
         return {
@@ -1158,10 +1574,7 @@ export default defineContentScript({
 
       // Same set the list shows. Hide spam's fallback keeps every comment when
       // YouTube's Top marks are missing, and search has to follow that.
-      const source =
-        hideFilteredComments && canFilterByRanking()
-          ? flattenCommentThreads(listedThreads())
-          : Array.from(comments.values());
+      const source = await collectListedComments();
       const entries: Array<{ id: string; hay: string }> = [];
       for (let indexCursor = 0; indexCursor < source.length; indexCursor += 1) {
         if (generation !== searchGeneration) return null;
@@ -1248,10 +1661,60 @@ export default defineContentScript({
         return undefined;
       }
 
+      const messageType = (message as { type?: string }).type;
+      if (messageType === CRAWL_MESSAGES.pageFetch) {
+        if (window !== window.top) return undefined;
+        const request = message as {
+          token?: string;
+          clickTrackingParams?: string;
+          authorize?: boolean;
+        };
+        if (typeof request.token !== 'string') {
+          return { error: 'Missing continuation.' };
+        }
+        return fetchRawFromPage(
+          request.token,
+          request.clickTrackingParams,
+          request.authorize !== false,
+        );
+      }
+
+      if (messageType === CRAWL_MESSAGES.batch) {
+        if (window !== window.top) return undefined;
+        const batch = message as {
+          requestId?: string;
+          videoId?: string;
+          count?: number;
+          comments?: YouTubeComment[];
+          patches?: CommentPatch[];
+          totalCommentsLabel?: string | null;
+        };
+        if (
+          batch.requestId &&
+          batch.requestId === activeCrawlRequestId &&
+          batch.videoId === activeVideoId
+        ) {
+          status = 'loading-all';
+          loadAllCount = typeof batch.count === 'number' ? batch.count : comments.size;
+          applyListedCommentCount(batch.totalCommentsLabel);
+          if (batch.comments?.length || batch.patches?.length) {
+            hasFetchedRanks = true;
+            for (const comment of batch.comments ?? []) remember(comment);
+            for (const patch of batch.patches ?? []) applyPatch(patch);
+            capturedAt = new Date().toISOString();
+          }
+          publishUpdate();
+        }
+        return { ok: true };
+      }
+
       const request = message as CollectorRequest;
 
       if (request.type === COMMENT_MESSAGES.getSnapshot) {
         if (request.sortOrder) sortOrder = toCommentSortOrder(request.sortOrder);
+        if (typeof request.hideFilteredComments === 'boolean') {
+          hideFilteredComments = request.hideFilteredComments;
+        }
         scan();
         return Promise.resolve(getSnapshot());
       }
@@ -1261,17 +1724,18 @@ export default defineContentScript({
         if (typeof request.hideFilteredComments === 'boolean') {
           hideFilteredComments = request.hideFilteredComments;
         }
-        const threads = listedThreads();
+        refreshPageReplyCounts();
         const offset = Math.max(0, Math.floor(request.offset) || 0);
         const limit = Math.min(
-          MAX_FETCHED_COMMENTS,
+          MAX_COMMENT_PAGE_THREADS,
           Math.max(1, Math.floor(request.limit ?? MAX_SNAPSHOT_COMMENTS) || MAX_SNAPSHOT_COMMENTS),
         );
+        const threads = threadsFrom(offset, limit);
         const response: CommentsPageResponse = {
           videoId: activeVideoId,
           offset,
-          comments: flattenCommentThreads(threads.slice(offset, offset + limit)),
-          total: threads.length,
+          comments: flattenCommentThreads(threads),
+          total: orderedRootIds().length,
           sortOrder,
           hideFilteredComments,
         };

@@ -1,8 +1,11 @@
 import { getYouTubeVideoId } from '@/lib/comments';
 import {
   INNERTUBE_BRIDGE,
+  InnertubeRateLimitError,
   fetchAllVideoComments,
+  fetchContinuationText,
   fetchVideoCommentCount,
+  readInnertubeSession,
   type CommentCountRequest,
   type CommentCountResult,
   type LoadAllProgress,
@@ -95,8 +98,82 @@ export default defineContentScript({
         return;
       }
 
-      const data = event.data as LoadAllRequest | CommentCountRequest | null;
-      if (!data || typeof data !== 'object' || !('type' in data)) return;
+      const data = event.data as
+        | LoadAllRequest
+        | CommentCountRequest
+        | {
+            type?: string;
+            requestId?: string;
+            videoId?: string;
+            token?: string;
+            clickTrackingParams?: string;
+          }
+        | null;
+      if (!data || typeof data !== 'object' || !('type' in data) || typeof data.type !== 'string') {
+        return;
+      }
+
+      if (data.type === INNERTUBE_BRIDGE.sessionRequest) {
+        const requestId = (data as { requestId?: string }).requestId;
+        if (typeof requestId !== 'string') return;
+        try {
+          const session = JSON.parse(JSON.stringify(readInnertubeSession())) as ReturnType<
+            typeof readInnertubeSession
+          >;
+          window.postMessage(
+            { type: INNERTUBE_BRIDGE.sessionResult, requestId, session },
+            window.location.origin,
+          );
+        } catch (error) {
+          window.postMessage(
+            {
+              type: INNERTUBE_BRIDGE.sessionResult,
+              requestId,
+              error:
+                error instanceof Error
+                  ? error.message
+                  : 'YouTube client data is not ready. Refresh the video page.',
+            },
+            window.location.origin,
+          );
+        }
+        return;
+      }
+
+      if (data.type === INNERTUBE_BRIDGE.rawFetch) {
+        const request = data as {
+          requestId?: string;
+          token?: string;
+          clickTrackingParams?: string;
+          authorize?: boolean;
+        };
+        if (typeof request.requestId !== 'string' || typeof request.token !== 'string') {
+          return;
+        }
+        const { requestId, token, clickTrackingParams } = request;
+        void fetchContinuationText(token, clickTrackingParams, request.authorize !== false)
+          .then((body) => {
+            window.postMessage(
+              { type: INNERTUBE_BRIDGE.rawResult, requestId, body },
+              window.location.origin,
+            );
+          })
+          .catch((error: unknown) => {
+            window.postMessage(
+              {
+                type: INNERTUBE_BRIDGE.rawResult,
+                requestId,
+                rateLimited: error instanceof InnertubeRateLimitError,
+                error:
+                  error instanceof Error
+                    ? error.message
+                    : 'Failed to load comments from YouTube.',
+              },
+              window.location.origin,
+            );
+          });
+        return;
+      }
 
       if (data.type === INNERTUBE_BRIDGE.countRequest) {
         if (typeof data.videoId !== 'string' || !data.videoId) return;
@@ -117,7 +194,7 @@ export default defineContentScript({
       const isCancelled = () => activeRequestId !== requestId;
 
       void fetchAllVideoComments(
-        (count, totalCommentsLabel, added) => {
+        (count, totalCommentsLabel, added, patches) => {
           if (isCancelled()) return;
           if (totalCommentsLabel) postCount(videoId, totalCommentsLabel);
           const progress: LoadAllProgress = {
@@ -125,6 +202,7 @@ export default defineContentScript({
             requestId,
             count,
             comments: added && added.length > 0 ? added : undefined,
+            patches: patches && patches.length > 0 ? patches : undefined,
             totalCommentsLabel,
           };
           window.postMessage(progress, window.location.origin);
@@ -141,7 +219,8 @@ export default defineContentScript({
           const message: LoadAllResult = {
             type: INNERTUBE_BRIDGE.result,
             requestId,
-            comments: result.comments,
+            comments: [],
+            count: result.count,
             truncated: result.truncated,
             totalCommentsLabel: result.totalCommentsLabel,
           };

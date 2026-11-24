@@ -123,6 +123,7 @@ export interface UiCopy {
   backendNotConfigured: string;
   backendRejected: string;
   rateLimited: string;
+  dailyQuota: string;
   commentsTooLarge: string;
   cloudTooSlow: string;
   backendUnreachable: string;
@@ -178,18 +179,18 @@ const EN: UiCopy = {
   autoSummarizeOn:
     'Auto summarize is on. Opening a video loads comments and saves the paragraph here.',
   summarizeIntro:
-    'Load the comment thread from YouTube, then summarize up to {count} comments with Gemini. You do not need to scroll the page.',
+    'Load the comment thread from YouTube, then summarize it with Gemini. You do not need to scroll the page.',
   summarizeNow: 'Summarize this video now',
   summarizeAll: 'Summarize all comments',
   privacyNote:
     'Comment text is sent to Gemini through your secure backend. Most videos load in a few seconds.',
   runsInTab: 'This runs in the tab. You can close the popup.',
   keepPopupOpen: 'Fetching the thread in the background. Keep this popup open.',
-  takesSeconds: 'This normally takes only a few seconds.',
+  takesSeconds: 'Long threads can take several minutes.',
   tryAgain: 'Try again',
   basedOn: 'Based on {count} comments',
   newComments: 'New comments are available',
-  cappedAt: 'Capped at {count}',
+  cappedAt: 'Stopped early at {count}',
   update: 'Update',
   updateTitle: 'Summarize the comments already loaded',
   askComments: 'Ask the comments',
@@ -270,6 +271,7 @@ const EN: UiCopy = {
     'The cloud summary service is not configured. Set WXT_SUMMARY_API_URL to your Coolify backend and rebuild the extension.',
   backendRejected: 'The summary backend rejected this extension. Check WXT_SUMMARY_API_TOKEN.',
   rateLimited: 'The free AI service is busy or rate-limited. Please wait a minute and try again.',
+  dailyQuota: 'The free AI quota for today is used up. Please try again tomorrow.',
   commentsTooLarge: 'The captured comments are too large for one summary request.',
   cloudTooSlow: 'The cloud AI took too long to respond. Please try again.',
   backendUnreachable:
@@ -297,6 +299,7 @@ const KNOWN_MESSAGES: Record<string, keyof UiCopy> = {
     'backendRejected',
   'The free AI service is busy or rate-limited. Please wait a minute and try again.':
     'rateLimited',
+  'The free AI quota for today is used up. Please try again tomorrow.': 'dailyQuota',
   'The captured comments are too large for one summary request.': 'commentsTooLarge',
   'The cloud AI took too long to respond. Please try again.': 'cloudTooSlow',
   'The summary backend could not be reached. Check its URL and your internet connection.':
@@ -470,7 +473,10 @@ export function uiText(language: string): UiCopy {
     (alias ? SEARCH_COPY[alias] : undefined) ??
     SEARCH_COPY[base];
   if (!pack && !chrome && !search) return EN;
-  return { ...EN, ...pack, ...chrome, ...search };
+  const copy = { ...EN, ...pack, ...chrome, ...search };
+  // Older translations still mention a fixed comment cap in this sentence.
+  if (copy.summarizeIntro.includes('{count}')) copy.summarizeIntro = EN.summarizeIntro;
+  return copy;
 }
 
 const UiTextContext = createContext({ language: 'en', copy: EN });

@@ -1,12 +1,14 @@
 import {
-  MAX_FETCHED_COMMENTS,
+  CRAWL_COMMENT_FUSE,
+  CRAWL_PAGE_FUSE,
   canonicalYouTubeCommentId,
   getYouTubeVideoId,
+  parentCommentId,
+  replyButtonCountFromText,
+  type CommentPatch,
   type CommentSortOrder,
   type YouTubeComment,
 } from '@/lib/comments';
-
-export { MAX_FETCHED_COMMENTS };
 
 export const INNERTUBE_BRIDGE = {
   request: 'comment-catcher:load-all',
@@ -15,16 +17,41 @@ export const INNERTUBE_BRIDGE = {
   countRequest: 'comment-catcher:comment-count',
   countResult: 'comment-catcher:comment-count-result',
   ready: 'comment-catcher:bridge-ready',
+  sessionRequest: 'comment-catcher:session',
+  sessionResult: 'comment-catcher:session-result',
+  rawFetch: 'comment-catcher:raw-fetch',
+  rawResult: 'comment-catcher:raw-result',
 } as const;
 
-const MAX_CONTINUATION_PAGES = 2_000;
 const PAGE_CONCURRENCY = 2;
-const REPLY_CONCURRENCY = 8;
+const REPLY_CONCURRENCY = 6;
+const RATE_LIMIT_ATTEMPTS = 12;
+
+// Captured before YouTube wraps fetch. A wrapped fetch applies the response
+// to the open comments section, so a Newest request would switch the page's
+// own sort control.
+const innertubeFetch = globalThis.fetch.bind(globalThis);
 
 interface InnertubeContext {
   client: Record<string, unknown>;
   user?: Record<string, unknown>;
   request?: Record<string, unknown>;
+}
+
+export interface InnertubeSession {
+  context: InnertubeContext;
+  apiKey: string;
+  clientName: string;
+  clientVersion: string;
+  visitorId: string;
+  sessionIndex: string;
+}
+
+export class InnertubeRateLimitError extends Error {
+  constructor() {
+    super('YouTube rate-limited comment loading. Wait a minute, then try again.');
+    this.name = 'InnertubeRateLimitError';
+  }
 }
 
 interface QueuedToken {
@@ -35,7 +62,14 @@ interface QueuedToken {
   // Set on top-level pages so every comment on the page can be given the
   // position YouTube gave it in that order.
   sort?: CommentSortOrder;
+  attempt?: number;
 }
+
+export type ContinuationFetcher = (
+  token: string,
+  clickTrackingParams?: string,
+  sort?: CommentSortOrder,
+) => Promise<unknown>;
 
 export interface LoadAllRequest {
   type: typeof INNERTUBE_BRIDGE.request;
@@ -48,6 +82,7 @@ export interface LoadAllProgress {
   requestId: string;
   count: number;
   comments?: YouTubeComment[];
+  patches?: CommentPatch[];
   totalCommentsLabel?: string | null;
 }
 
@@ -55,6 +90,7 @@ export interface LoadAllResult {
   type: typeof INNERTUBE_BRIDGE.result;
   requestId: string;
   comments: YouTubeComment[];
+  count?: number;
   truncated: boolean;
   totalCommentsLabel?: string | null;
   error?: string;
@@ -126,7 +162,9 @@ function getYtInitialData(): unknown {
 let activeFetchVideoId = '';
 
 function getWatchId(): string {
-  return activeFetchVideoId || getYouTubeVideoId(window.location.href) || '';
+  if (activeFetchVideoId) return activeFetchVideoId;
+  if (typeof window === 'undefined') return '';
+  return getYouTubeVideoId(window.location.href) || '';
 }
 
 function videoIdFromPayload(payload: unknown): string | null {
@@ -684,10 +722,17 @@ function commentFromEntity(
   const toolbarStateKey = readString(properties?.toolbarStateKey, payload.toolbarStateKey);
   const replyLevel = Number(properties?.replyLevel ?? 0);
   const dottedParent = id.includes('.') ? id.slice(0, id.indexOf('.')) : '';
+  // A reply page's entity batch also carries comments from other threads.
+  // The inherited parent applies only when this id already belongs to it.
+  const belongsToInherited = Boolean(
+    inheritedParentId &&
+      inheritedParentId !== id &&
+      (id.startsWith(`${inheritedParentId}.`) || parentCommentId(id) === inheritedParentId),
+  );
   const parentId =
     readString(properties?.parentCommentId, payload.parentCommentId) ||
     dottedParent ||
-    (inheritedParentId && inheritedParentId !== id ? inheritedParentId : '');
+    (belongsToInherited ? inheritedParentId ?? '' : '');
   const commentIsReply =
     isReply || replyLevel > 0 || Boolean(parentId) || id.includes('.');
 
@@ -972,22 +1017,60 @@ function walkedCommentId(
   return key ? byKey.get(key) ?? '' : '';
 }
 
+function countFromReplyLabel(value: string): string | null {
+  // The view-replies control is the number on the watch page. Bare digits are
+  // accepted because that button is often just "229".
+  return replyButtonCountFromText(value, true);
+}
+
+function buttonLabel(node: unknown): string {
+  if (typeof node === 'string') return node;
+  const record = asRecord(node);
+  if (!record) return '';
+  const accessible = asRecord(asRecord(record.accessibility)?.accessibilityData)?.label;
+  const title = asRecord(record.title);
+  const text = asRecord(record.text);
+  return [
+    runsToText(record.text),
+    runsToText(record.title),
+    readString(
+      record.title,
+      record.text,
+      record.accessibilityText,
+      record.label,
+      record.simpleText,
+      record.content,
+      title?.simpleText,
+      title?.content,
+      text?.simpleText,
+      text?.content,
+      accessible,
+    ),
+    runsToText(accessible),
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
+
+// The expand button is the count YouTube draws on the watch page. The comment
+// toolbar's replyCount is a different total (it includes replies the button
+// leaves out) and must not be used in its place.
 function replyButtonCount(replies: Record<string, unknown>): string | null {
-  const button =
-    asRecord(asRecord(replies.viewReplies)?.buttonRenderer) ??
-    asRecord(replies.viewReplies);
-  const label = asRecord(asRecord(button?.accessibility)?.accessibilityData)?.label;
-  const text =
-    runsToText(button?.text) ||
-    runsToText(button?.title) ||
-    runsToText(label) ||
-    readString(label) ||
-    runsToText(replies.viewReplies);
-  const match = text.replace(/\s+/g, ' ').trim().match(/^(\d[\d.,]*)\s*([KMB])?(?:\s|$)/i);
-  if (!match?.[1]) return null;
-  if (match[2]) return `${match[1].replace(/[^\d]/g, '')}${match[2].toUpperCase()}`;
-  const digits = match[1].replace(/[^\d]/g, '');
-  return digits ? String(Number(digits)) : null;
+  // Only the expand button. Reading the whole replies renderer picks up a
+  // nested count or the toolbar total, which is not the number on the page.
+  const view = asRecord(replies.viewReplies);
+  if (!view) return null;
+  const candidates = [
+    view.buttonRenderer,
+    view.buttonViewModel,
+    asRecord(view.button)?.buttonRenderer,
+    asRecord(view.button)?.buttonViewModel,
+  ];
+  for (const candidate of candidates) {
+    const count = countFromReplyLabel(buttonLabel(candidate));
+    if (count) return count;
+  }
+  return null;
 }
 
 function repliesRendererOf(
@@ -1057,10 +1140,24 @@ function walkCommentItems(
 
     const id = walkedCommentId(record, byKey);
     if (id && !seen.has(id)) {
+      // Top-level items on a reply continuation are not all replies of the
+      // thread being fetched. The parent itself stays so its replies renderer
+      // is still walked. A nested node (depth > 0) was found inside that
+      // comment's replies renderer, so it does belong there.
+      const isParent = Boolean(parentId) && id === parentId;
+      const childOfParent =
+        !parentId ||
+        depth > 0 ||
+        isParent ||
+        id.startsWith(`${parentId}.`) ||
+        parentCommentId(id) === parentId;
+      if (!childOfParent) continue;
       seen.add(id);
-      into.push({ id, replyToId: parentId });
-      for (const comment of commentsFromItems([record], Boolean(parentId))) {
-        if (!comments.has(comment.id)) comments.set(comment.id, comment);
+      if (!isParent) {
+        into.push({ id, replyToId: parentId || null });
+        for (const comment of commentsFromItems([record], Boolean(parentId))) {
+          if (!comments.has(comment.id)) comments.set(comment.id, comment);
+        }
       }
     }
 
@@ -1084,8 +1181,16 @@ function walkCommentItems(
       );
     }
 
+    // Only the comment that owns this expander. Falling back to the parent
+    // would replace that parent's button total with a nested reply's.
     const buttonCount = replyButtonCount(replies);
-    if (buttonCount) replyButtonCounts.set(ownerId, buttonCount);
+    if (buttonCount && id) {
+      const next = parseCompactCount(buttonCount);
+      const prev = parseCompactCount(replyButtonCounts.get(id));
+      if (prev == null || (next != null && next >= prev)) {
+        replyButtonCounts.set(id, buttonCount);
+      }
+    }
 
     const viewToken = continuationFrom(replies.viewReplies);
     if (viewToken) {
@@ -1114,6 +1219,7 @@ function parseNextResponse(
   data: unknown,
   isReply: boolean,
   parentId?: string,
+  scanHeader = true,
 ): {
   comments: YouTubeComment[];
   pageTokens: QueuedToken[];
@@ -1136,13 +1242,15 @@ function parseNextResponse(
   const walked: WalkedComment[] = [];
   const seenWalked = new Set<string>();
   const byKey = commentIdsByEntityKey(data);
-  let sortToken = extractSortToken(data);
-  let totalCommentsLabel = extractCommentsCountLabel(data);
+  // Continuation pages do not carry the comments header. Walking the whole
+  // payload to look for it is most of the main-thread cost of a long crawl.
+  let sortToken = scanHeader ? extractSortToken(data) : null;
+  let totalCommentsLabel = scanHeader ? extractCommentsCountLabel(data) : null;
 
   for (const list of continuationLists(data)) {
     const items = flattenItems(list);
     const rendered = commentsFromItems(items, isReply);
-    const headerToken = extractSortToken(items);
+    const headerToken = scanHeader ? extractSortToken(items) : null;
 
     if (headerToken) sortToken = headerToken;
     for (const comment of rendered) comments.set(comment.id, comment);
@@ -1175,6 +1283,7 @@ function parseNextResponse(
       }
     }
     for (const id of orderedIdsFromItems(items)) {
+      if (isReply && parentId && id !== parentId && !id.startsWith(`${parentId}.`)) continue;
       if (id.includes('.')) {
         if (seenReply.has(id)) continue;
         seenReply.add(id);
@@ -1200,14 +1309,17 @@ function parseNextResponse(
     if (!comment) continue;
     comments.set(entry.id, {
       ...comment,
+      parentId: comment.parentId || entry.replyToId,
       replyToId: entry.replyToId,
       isReply: true,
     });
   }
 
   if (parentId) {
+    const prefix = `${parentId}.`;
     for (const [id, comment] of comments) {
       if (id === parentId || comment.parentId) continue;
+      if (!id.startsWith(prefix)) continue;
       comments.set(id, { ...comment, parentId, isReply: true });
     }
     for (const token of pageTokens) {
@@ -1270,11 +1382,12 @@ async function sapisidAuthorization(): Promise<string | null> {
   }
 }
 
-async function fetchInnertube(
+async function requestInnertube(
   context: InnertubeContext,
   body: Record<string, unknown>,
   clickTrackingParams?: string,
-): Promise<unknown> {
+  authorize = true,
+): Promise<Response> {
   const apiKey = readString(getYtcfgValue('INNERTUBE_API_KEY'));
   const visitorId = readString(
     getYtcfgValue('VISITOR_DATA'),
@@ -1303,7 +1416,10 @@ async function fetchInnertube(
   };
   if (visitorId) headers['X-Goog-Visitor-Id'] = visitorId;
 
-  const authorization = await sapisidAuthorization();
+  // Newest is fetched unsigned. An authenticated Newest continuation is the
+  // same call as picking "Newest" in the header, and YouTube saves it as the
+  // sort used the next time the page loads.
+  const authorization = authorize ? await sapisidAuthorization() : null;
   if (authorization) {
     headers.Authorization = authorization;
     headers['X-Origin'] = window.location.origin;
@@ -1311,11 +1427,11 @@ async function fetchInnertube(
   }
 
   const send = () =>
-    fetch(url, {
+    innertubeFetch(url, {
       method: 'POST',
       headers,
       body: JSON.stringify(payload),
-      credentials: 'same-origin',
+      credentials: authorize ? 'same-origin' : 'omit',
     });
 
   let response = await send();
@@ -1331,17 +1447,60 @@ async function fetchInnertube(
     response = await send();
   }
 
+  return response;
+}
+
+async function fetchInnertube(
+  context: InnertubeContext,
+  body: Record<string, unknown>,
+  clickTrackingParams?: string,
+  authorize = true,
+): Promise<unknown> {
+  const response = await requestInnertube(context, body, clickTrackingParams, authorize);
+  if (response.status === 429 || response.status === 403) {
+    throw new InnertubeRateLimitError();
+  }
   if (!response.ok) {
-    if (response.status === 429 || response.status === 403) {
-      throw new Error(
-        'YouTube rate-limited comment loading. Wait a minute, then try again.',
-      );
-    }
     throw new Error(`YouTube returned ${response.status} while loading comments.`);
   }
+  return parseInnertubeText(await response.text());
+}
 
-  const raw = await response.text();
+export function parseInnertubeText(raw: string): unknown {
   return JSON.parse(raw.replace(/^\)\]\}'/, ''));
+}
+
+export function readInnertubeSession(): InnertubeSession {
+  const context = getInnertubeContext();
+  const client = asRecord(context.client);
+  return {
+    context,
+    apiKey: readString(getYtcfgValue('INNERTUBE_API_KEY')),
+    clientName: String(getYtcfgValue('INNERTUBE_CONTEXT_CLIENT_NAME') ?? '1'),
+    clientVersion: String(getYtcfgValue('INNERTUBE_CLIENT_VERSION') ?? ''),
+    visitorId: readString(getYtcfgValue('VISITOR_DATA'), client?.visitorData),
+    sessionIndex: readString(getYtcfgValue('SESSION_INDEX')) || '0',
+  };
+}
+
+export async function fetchContinuationText(
+  token: string,
+  clickTrackingParams?: string,
+  authorize = true,
+): Promise<string> {
+  const response = await requestInnertube(
+    getInnertubeContext(),
+    { continuation: token },
+    clickTrackingParams,
+    authorize,
+  );
+  if (response.status === 429 || response.status === 403) {
+    throw new InnertubeRateLimitError();
+  }
+  if (!response.ok) {
+    throw new Error(`YouTube returned ${response.status} while loading comments.`);
+  }
+  return response.text();
 }
 
 function sectionContents(section: unknown): unknown[] {
@@ -1408,18 +1567,64 @@ export async function fetchVideoCommentCount(
     const fromWatch = extractCommentsCountLabel(watchNext);
     if (fromWatch) return fromWatch;
   } catch {
-    // Fall through to the comments continuation, which has the header count.
+    // The comments header on the watch page is read separately.
   }
 
-  const generated = generateCommentContinuation(videoId, 'newest');
-  if (!generated) return null;
+  return null;
+}
 
-  const data = await fetchInnertube(context, { continuation: generated });
-  if (isCancelled?.() || getYouTubeVideoId(window.location.href) !== videoId) {
-    return null;
+function parseCompactCount(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const match = value.replace(/[,\s]/g, '').match(/^(\d+(?:\.\d+)?)([KMB])?$/i);
+  if (!match?.[1]) return null;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount)) return null;
+  const suffix = (match[2] || '').toUpperCase();
+  const scale =
+    suffix === 'K' ? 1_000 : suffix === 'M' ? 1_000_000 : suffix === 'B' ? 1_000_000_000 : 1;
+  return Math.round(amount * scale);
+}
+
+function preferReplyTotal(
+  previous: string | null | undefined,
+  incoming: string | null | undefined,
+): string | null {
+  const prev = parseCompactCount(previous);
+  const next = parseCompactCount(incoming);
+  if (prev == null) return incoming ?? previous ?? null;
+  if (next == null || next < prev) return previous ?? null;
+  return incoming ?? null;
+}
+
+async function pauseCrawl(ms: number, stillHere: () => boolean): Promise<void> {
+  const step = 4_000;
+  let left = ms;
+  while (left > 0 && stillHere()) {
+    const slice = Math.min(step, left);
+    await new Promise((resolve) => setTimeout(resolve, slice));
+    left -= slice;
+    if (typeof document === 'undefined') {
+      const runtime = (
+        globalThis as {
+          chrome?: { runtime?: { getPlatformInfo?: () => Promise<unknown> } };
+        }
+      ).chrome?.runtime;
+      await runtime?.getPlatformInfo?.().catch(() => undefined);
+    }
   }
+}
 
-  return parseNextResponse(data, false).totalCommentsLabel;
+interface HeldComment {
+  replyToId: string | null;
+  topRank: number | null;
+  newestRank: number | null;
+  replyRank: number | null;
+  featured: boolean;
+  featuredReplyCount: string | null;
+  isPinned: boolean;
+  pinnedLabel: string | null;
+  likeCount: string | null;
+  replyCount: string | null;
 }
 
 export async function fetchAllVideoComments(
@@ -1427,32 +1632,54 @@ export async function fetchAllVideoComments(
     count: number,
     totalCommentsLabel?: string | null,
     added?: YouTubeComment[],
-  ) => void,
-  maxComments = MAX_FETCHED_COMMENTS,
+    patches?: CommentPatch[],
+  ) => void | Promise<void>,
+  maxComments = Number.POSITIVE_INFINITY,
   expectedVideoId?: string,
   isCancelled?: () => boolean,
+  fetchPage?: ContinuationFetcher,
 ): Promise<{
-  comments: YouTubeComment[];
+  count: number;
   truncated: boolean;
   totalCommentsLabel: string | null;
 }> {
-  const videoId = expectedVideoId || getYouTubeVideoId(window.location.href) || '';
+  const videoId =
+    expectedVideoId ||
+    (typeof window === 'undefined' ? '' : getYouTubeVideoId(window.location.href) || '');
   if (!videoId) {
     throw new Error('Open a YouTube video first.');
   }
 
-  await waitForWatchId(videoId);
-  if (isCancelled?.()) {
-    return { comments: [], truncated: false, totalCommentsLabel: null };
+  const onPage = !fetchPage;
+  const stillHere = () => {
+    if (isCancelled?.()) return false;
+    if (!onPage || typeof window === 'undefined') return true;
+    return getYouTubeVideoId(window.location.href) === videoId;
+  };
+
+  if (onPage) {
+    await waitForWatchId(videoId);
+    if (!stillHere()) {
+      return { count: 0, truncated: false, totalCommentsLabel: null };
+    }
   }
 
   activeFetchVideoId = videoId;
-  const context = getInnertubeContext();
-  const collected = new Map<string, YouTubeComment>();
+  const commentCap = Math.min(
+    Number.isFinite(maxComments) ? maxComments : CRAWL_COMMENT_FUSE,
+    CRAWL_COMMENT_FUSE,
+  );
+  const held = new Map<string, HeldComment>();
   const seenTokens = new Set<string>();
+  const queuedKeys = new Set<string>();
   const pageQueue: QueuedToken[] = [];
   const replyQueue: QueuedToken[] = [];
+  const topReplySeen = new Map<string, number>();
+  const topReplyCounted = new Set<string>();
   let totalCommentsLabel: string | null = null;
+  let gaveUp = false;
+  let rateStrikes = 0;
+  let pausedUntil = 0;
 
   // Positions YouTube gave each comment, per order. Walking both listings is
   // the only way to reproduce "Top", and it also tells us which comments
@@ -1476,10 +1703,58 @@ export async function fetchAllVideoComments(
   let topCursor = 0;
   let newestCursor = 0;
 
+  // Nested replies share the root id before the dot, and the button total
+  // counts them too. A cap stored on the root applies to every continuation
+  // of that thread, including "View reply" pages.
+  const replyRoot = (id: string | undefined): string => {
+    if (!id) return '';
+    return parentCommentId(id) || id;
+  };
+
+  const topReplyCapped = (parentId: string | undefined): boolean => {
+    const root = replyRoot(parentId);
+    if (!root) return false;
+    const cap = parseCompactCount(featuredReplyCounts.get(root));
+    if (cap == null) return false;
+    return (topReplySeen.get(root) ?? 0) >= cap;
+  };
+
+  const noteTopReply = (id: string): void => {
+    if (!id || topReplyCounted.has(id)) return;
+    const root = parentCommentId(id);
+    if (!root) return;
+    topReplyCounted.add(id);
+    topReplySeen.set(root, (topReplySeen.get(root) ?? 0) + 1);
+  };
+
+  const enqueue = (queue: QueuedToken[], next: QueuedToken | null): void => {
+    if (!next?.token || next.token.length < 16) return;
+    if (next.sort === 'top' && next.isReply && topReplyCapped(next.parentId)) return;
+    const key = tokenChainKey(next);
+    if (seenTokens.has(key) || queuedKeys.has(key)) return;
+    queuedKeys.add(key);
+    queue.push(next);
+  };
+
+  const requeue = (next: QueuedToken): void => {
+    const key = tokenChainKey(next);
+    seenTokens.delete(key);
+    if (queuedKeys.has(key)) return;
+    queuedKeys.add(key);
+    const queue = next.isReply ? replyQueue : pageQueue;
+    queue.unshift(next);
+  };
+
+  const take = (queue: QueuedToken[], index: number): QueuedToken | undefined => {
+    const [next] = queue.splice(index, 1);
+    if (next) queuedKeys.delete(tokenChainKey(next));
+    return next;
+  };
+
   for (const order of ['top', 'newest'] as const) {
     const generated = generateCommentContinuation(videoId, order);
     if (generated) {
-      pushToken(pageQueue, { token: generated, isReply: false, sort: order });
+      enqueue(pageQueue, { token: generated, isReply: false, sort: order });
     }
   }
 
@@ -1515,19 +1790,72 @@ export async function fetchAllVideoComments(
     }
   };
 
-  const withRanks = (comment: YouTubeComment): YouTubeComment => ({
-    ...comment,
-    topRank: topRanks.get(comment.id) ?? comment.topRank ?? null,
-    newestRank: newestRanks.get(comment.id) ?? comment.newestRank ?? null,
-    replyRank:
-      topReplyRanks.get(comment.id) ??
-      newestReplyRanks.get(comment.id) ??
-      comment.replyRank ??
-      null,
-    featured: featuredIds.has(comment.id) || comment.featured === true,
-    featuredReplyCount:
-      featuredReplyCounts.get(comment.id) ?? comment.featuredReplyCount ?? null,
+  const heldFrom = (comment: YouTubeComment): HeldComment => ({
+    replyToId: comment.replyToId ?? null,
+    topRank: topRanks.get(comment.id) ?? null,
+    newestRank: newestRanks.get(comment.id) ?? null,
+    // Newest ranks are not the order behind the reply button. Leaving them
+    // off replyRank keeps those replies behind the Top set when Hide spam
+    // has to fill up to the button total.
+    replyRank: topReplyRanks.get(comment.id) ?? null,
+    featured: featuredIds.has(comment.id),
+    featuredReplyCount: featuredReplyCounts.get(comment.id) ?? null,
+    isPinned: comment.isPinned,
+    pinnedLabel: comment.pinnedLabel ?? null,
+    likeCount: comment.likeCount,
+    replyCount: comment.replyCount,
   });
+
+  const mergeHeld = (prev: HeldComment, comment: YouTubeComment): HeldComment => {
+    const next = heldFrom(comment);
+    return {
+      replyToId: prev.replyToId || next.replyToId,
+      topRank: next.topRank ?? prev.topRank,
+      newestRank: next.newestRank ?? prev.newestRank,
+      replyRank: next.replyRank ?? prev.replyRank,
+      featured: prev.featured || next.featured,
+      featuredReplyCount: preferReplyTotal(prev.featuredReplyCount, next.featuredReplyCount),
+      isPinned: prev.isPinned || next.isPinned,
+      pinnedLabel: next.pinnedLabel || prev.pinnedLabel,
+      likeCount: next.likeCount ?? prev.likeCount,
+      replyCount: next.replyCount ?? prev.replyCount,
+    };
+  };
+
+  const materialize = (comment: YouTubeComment, state: HeldComment): YouTubeComment => ({
+    ...comment,
+    replyToId: state.replyToId,
+    topRank: state.topRank,
+    newestRank: state.newestRank,
+    replyRank: state.replyRank,
+    featured: state.featured,
+    featuredReplyCount: state.featuredReplyCount,
+    isPinned: state.isPinned,
+    pinnedLabel: state.pinnedLabel,
+    likeCount: state.likeCount,
+    replyCount: state.replyCount,
+  });
+
+  const toPatch = (id: string, prev: HeldComment, next: HeldComment): CommentPatch | null => {
+    const patch: CommentPatch = { id };
+    let changed = false;
+    const assign = <K extends keyof HeldComment>(key: K) => {
+      if (prev[key] === next[key]) return;
+      patch[key] = next[key] as never;
+      changed = true;
+    };
+    assign('topRank');
+    assign('newestRank');
+    assign('replyRank');
+    assign('featured');
+    assign('featuredReplyCount');
+    assign('replyToId');
+    assign('isPinned');
+    assign('pinnedLabel');
+    assign('likeCount');
+    assign('replyCount');
+    return changed ? patch : null;
+  };
 
   if (pageQueue.length === 0 && replyQueue.length === 0) {
     throw new Error(
@@ -1535,105 +1863,168 @@ export async function fetchAllVideoComments(
     );
   }
 
-  onProgress(collected.size, totalCommentsLabel);
+  await onProgress(held.size, totalCommentsLabel);
 
   let pages = 0;
-  let rateLimited = false;
 
   const fetchToken = async (next: QueuedToken): Promise<void> => {
-    if (isCancelled?.()) return;
-    if (getYouTubeVideoId(window.location.href) !== videoId) return;
-    if (seenTokens.has(tokenChainKey(next)) || collected.size >= maxComments) return;
-    if (pages >= MAX_CONTINUATION_PAGES || rateLimited) return;
-    seenTokens.add(tokenChainKey(next));
-    pages += 1;
+    if (!stillHere() || gaveUp || held.size >= commentCap || pages >= CRAWL_PAGE_FUSE) {
+      return;
+    }
+    const key = tokenChainKey(next);
+    if (seenTokens.has(key)) return;
+    seenTokens.add(key);
 
+    const wait = pausedUntil - Date.now();
+    if (wait > 0) await pauseCrawl(wait, stillHere);
+    if (!stillHere() || gaveUp) return;
+
+    let data: unknown;
     try {
-      const data = await fetchInnertube(
-        context,
-        { continuation: next.token },
-        next.clickTrackingParams,
-      );
-      if (isCancelled?.() || getYouTubeVideoId(window.location.href) !== videoId) {
-        return;
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        await new Promise((resolve) => setTimeout(resolve, 0));
       }
-      const parsed = parseNextResponse(data, next.isReply, next.parentId);
-      if (!totalCommentsLabel && parsed.totalCommentsLabel) {
-        totalCommentsLabel = parsed.totalCommentsLabel;
-      }
-
-      rankPage(next.sort, parsed.orderedRootIds);
-      if (parsed.orderedReplyIds.length > 0) {
-        rankReplies(parsed.orderedReplyIds, next.sort);
-      }
-
-      // Everything this page carried is part of the listing it came from.
-      if (next.sort === 'top') {
-        for (const comment of parsed.comments) {
-          featuredIds.add(comment.id);
-          if (
-            !comment.isReply &&
-            comment.replyCount &&
-            !parsed.replyButtonCounts.has(comment.id)
-          ) {
-            featuredReplyCounts.set(comment.id, comment.replyCount);
+      data = fetchPage
+        ? await fetchPage(next.token, next.clickTrackingParams, next.sort)
+        : await fetchInnertube(
+            getInnertubeContext(),
+            { continuation: next.token },
+            next.clickTrackingParams,
+            next.sort !== 'newest',
+          );
+    } catch (error) {
+      if (error instanceof InnertubeRateLimitError) {
+        // Several pages can fail together. Count that as one pause, or a
+        // short burst of 429s ends the crawl while comments are still arriving.
+        const alreadyPausing = pausedUntil > Date.now();
+        if (!alreadyPausing) {
+          rateStrikes += 1;
+          if (rateStrikes > RATE_LIMIT_ATTEMPTS) {
+            gaveUp = true;
+            return;
           }
         }
-        for (const [id, count] of parsed.replyButtonCounts) {
+        const delay = Math.min(8_000, 1_000 * 2 ** Math.min(rateStrikes, 3));
+        pausedUntil = Math.max(pausedUntil, Date.now() + delay);
+        requeue(next);
+        await pauseCrawl(Math.max(0, pausedUntil - Date.now()), stillHere);
+        return;
+      }
+      if ((next.attempt ?? 0) < 1) {
+        requeue({ ...next, attempt: (next.attempt ?? 0) + 1 });
+      }
+      return;
+    }
+
+    if (!stillHere()) return;
+    rateStrikes = Math.max(0, rateStrikes - 1);
+    pages += 1;
+
+    let parsed: ReturnType<typeof parseNextResponse>;
+    try {
+      activeFetchVideoId = videoId;
+      parsed = parseNextResponse(
+        data,
+        next.isReply,
+        next.parentId,
+        !next.isReply && !totalCommentsLabel,
+      );
+    } catch {
+      return;
+    }
+
+    if (!totalCommentsLabel && parsed.totalCommentsLabel) {
+      totalCommentsLabel = parsed.totalCommentsLabel;
+    }
+
+    rankPage(next.sort, parsed.orderedRootIds);
+    if (parsed.orderedReplyIds.length > 0) {
+      rankReplies(parsed.orderedReplyIds, next.sort);
+    }
+
+    // Only comments YouTube actually rendered on this Top page. The entity
+    // batch also carries replies that are not part of that listing, and
+    // marking those featured makes Hide spam keep comments the page hides.
+    if (next.sort === 'top') {
+      const rendered = new Set<string>([
+        ...parsed.orderedRootIds,
+        ...parsed.orderedReplyIds,
+      ]);
+      if (rendered.size === 0) {
+        for (const comment of parsed.comments) {
+          if (!comment.isReply) rendered.add(comment.id);
+        }
+      }
+      for (const id of rendered) featuredIds.add(id);
+      for (const [id, count] of parsed.replyButtonCounts) {
+        const nextCount = parseCompactCount(count);
+        const prevCount = parseCompactCount(featuredReplyCounts.get(id));
+        if (prevCount == null || (nextCount != null && nextCount > prevCount)) {
           featuredReplyCounts.set(id, count);
         }
       }
+    }
 
-      const added: YouTubeComment[] = [];
-      for (const comment of parsed.comments) {
-        if (collected.size >= maxComments) break;
-        const existing = collected.get(comment.id);
-        if (existing) {
-          // The first listing to name a parent keeps it. A later pass can
-          // still fill the parent in when the first one never saw the branch.
-          collected.set(comment.id, {
-            ...comment,
-            replyToId: existing.replyToId || comment.replyToId || null,
-          });
-          continue;
-        }
-        collected.set(comment.id, comment);
-        added.push(comment);
+    if (next.sort === 'top') {
+      // Only replies YouTube actually listed. The entity batch on a reply
+      // page also carries comments the button does not count; counting those
+      // hits the cap early and the rest of the public thread never loads.
+      const pageRoot = next.isReply ? replyRoot(next.parentId) : '';
+      for (const id of parsed.orderedReplyIds) {
+        const root = parentCommentId(id);
+        if (!root) continue;
+        if (pageRoot && root !== pageRoot) continue;
+        noteTopReply(id);
       }
+    }
 
-      // A page's own continuation stays inside the same sort chain, so the
-      // ranking cursor keeps counting in YouTube's order.
-      for (const token of parsed.pageTokens) {
-        const tagged = next.sort ? { ...token, sort: next.sort } : token;
-        if (tagged.isReply) replyQueue.push(tagged);
-        else pageQueue.push(tagged);
+    const added: YouTubeComment[] = [];
+    const patches: CommentPatch[] = [];
+    for (const comment of parsed.comments) {
+      const previous = held.get(comment.id);
+      if (previous) {
+        const merged = mergeHeld(previous, comment);
+        const patch = toPatch(comment.id, previous, merged);
+        held.set(comment.id, merged);
+        if (patch) patches.push(patch);
+        continue;
       }
-      for (const token of parsed.replyTokens) {
-        replyQueue.push(next.sort ? { ...token, sort: next.sort } : token);
-      }
-      onProgress(collected.size, totalCommentsLabel, added.map(withRanks));
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '';
-      if (message.includes('rate-limited')) {
-        rateLimited = true;
-        return;
-      }
-      // Skip a single failed reply thread and keep the rest.
+      if (held.size >= commentCap) break;
+      const state = heldFrom(comment);
+      held.set(comment.id, state);
+      added.push(materialize(comment, state));
+    }
+
+    const stopTopReplies =
+      next.sort === 'top' && next.isReply && topReplyCapped(next.parentId);
+    // Nested "View reply" continuations sit inside this page's button total,
+    // so they are walked before the next page of the same thread.
+    const continuations = next.isReply
+      ? [...parsed.replyTokens, ...(stopTopReplies ? [] : parsed.pageTokens)]
+      : [...(stopTopReplies ? [] : parsed.pageTokens), ...parsed.replyTokens];
+    for (const token of continuations) {
+      const tagged = next.sort ? { ...token, sort: next.sort } : token;
+      enqueue(tagged.isReply ? replyQueue : pageQueue, tagged);
+    }
+
+    if (added.length > 0 || patches.length > 0 || parsed.totalCommentsLabel) {
+      await onProgress(held.size, totalCommentsLabel, added, patches);
     }
   };
 
   const canContinue = () =>
-    collected.size < maxComments &&
-    pages < MAX_CONTINUATION_PAGES &&
-    !rateLimited &&
-    !isCancelled?.() &&
-    getYouTubeVideoId(window.location.href) === videoId;
+    held.size < commentCap &&
+    pages < CRAWL_PAGE_FUSE &&
+    !gaveUp &&
+    stillHere();
 
   let pageActive = 0;
   let replyActive = 0;
   const chainActive = new Map<string, number>();
+  const replyChainActive = new Map<string, number>();
   const running = new Set<Promise<void>>();
   const chainOf = (next: QueuedToken) => next.sort ?? 'unsorted';
+  const replyChainOf = (next: QueuedToken) => replyRoot(next.parentId) || next.parentId || next.token;
 
   const startToken = (next: QueuedToken, kind: 'page' | 'reply') => {
     if (kind === 'page') {
@@ -1641,6 +2032,8 @@ export async function fetchAllVideoComments(
       chainActive.set(chainOf(next), (chainActive.get(chainOf(next)) ?? 0) + 1);
     } else {
       replyActive += 1;
+      const chain = replyChainOf(next);
+      replyChainActive.set(chain, (replyChainActive.get(chain) ?? 0) + 1);
     }
 
     const task = fetchToken(next).finally(() => {
@@ -1649,6 +2042,8 @@ export async function fetchAllVideoComments(
         chainActive.set(chainOf(next), (chainActive.get(chainOf(next)) ?? 1) - 1);
       } else {
         replyActive -= 1;
+        const chain = replyChainOf(next);
+        replyChainActive.set(chain, (replyChainActive.get(chain) ?? 1) - 1);
       }
       running.delete(task);
     });
@@ -1665,7 +2060,7 @@ export async function fetchAllVideoComments(
       );
       if (index === -1) break;
 
-      const [next] = pageQueue.splice(index, 1);
+      const next = take(pageQueue, index);
       if (!next) break;
       startToken(next, 'page');
     }
@@ -1675,8 +2070,17 @@ export async function fetchAllVideoComments(
       replyQueue.length > 0 &&
       canContinue()
     ) {
-      const next = replyQueue.shift();
-      if (next) startToken(next, 'reply');
+      // One page at a time for a thread, in the order the tokens were queued,
+      // so the reply ranks stay in YouTube's order. A Top token queued before
+      // the button total was reached is dropped once that total is in.
+      const index = replyQueue.findIndex(
+        (item) => (replyChainActive.get(replyChainOf(item)) ?? 0) === 0,
+      );
+      if (index === -1) break;
+      const next = take(replyQueue, index);
+      if (!next) break;
+      if (next.sort === 'top' && next.isReply && topReplyCapped(next.parentId)) continue;
+      startToken(next, 'reply');
     }
   };
 
@@ -1686,20 +2090,14 @@ export async function fetchAllVideoComments(
     pump();
   }
 
-  if (rateLimited && collected.size === 0) {
-    throw new Error(
-      'YouTube rate-limited comment loading. Wait a minute, then try again.',
-    );
+  if (gaveUp && held.size === 0) {
+    throw new InnertubeRateLimitError();
   }
 
+  const hitFuse = held.size >= commentCap || pages >= CRAWL_PAGE_FUSE;
   return {
-    comments: [...collected.values()].map(withRanks),
-    truncated:
-      rateLimited ||
-      pageQueue.length > 0 ||
-      replyQueue.length > 0 ||
-      pages >= MAX_CONTINUATION_PAGES ||
-      collected.size >= maxComments,
+    count: held.size,
+    truncated: gaveUp || hitFuse || pageQueue.length > 0 || replyQueue.length > 0,
     totalCommentsLabel,
   };
 }

@@ -6,10 +6,11 @@ import {
   downloadBlob,
   rowsForExport,
   type CommentExportMeta,
+  type CommentExportRow,
 } from '@/lib/export-comments';
 import {
   COMMENT_MESSAGES,
-  MAX_FETCHED_COMMENTS,
+  MAX_COMMENT_PAGE_THREADS,
   MAX_SNAPSHOT_COMMENTS,
   type ChatAboutCommentsResponse,
   type CommentsPageResponse,
@@ -313,8 +314,10 @@ function listedThreadCount(
 }
 
 function repliesLabel(thread: CommentThread, copy: ReturnType<typeof uiText>): string {
-  const listed = thread.parent.replyCount;
-  const count = listed && listed !== '0' ? listed : String(thread.replies.length);
+  // The badge counts the replies in this thread. Hide spam has already removed
+  // the ones YouTube's reply button leaves out, so the number matches the page
+  // in that mode and includes those replies when spam is shown.
+  const count = String(thread.replies.length);
   return count === '1' ? copy.oneReply : fill(copy.manyReplies, { count });
 }
 
@@ -753,6 +756,72 @@ function CommentsPane({
     return groupCommentsForDisplay(source, sortOrder).slice(0, visibleCount);
   }, [searchQuery, searchHits, pageComments, visibleCount, snapshot, sortOrder]);
 
+  const threadOffsets = useMemo(() => {
+    const prefix = new Array<number>(visibleThreads.length + 1);
+    prefix[0] = 0;
+    for (let index = 0; index < visibleThreads.length; index += 1) {
+      const thread = visibleThreads[index];
+      const expanded = thread ? expandedThreadIds.has(thread.parent.id) : false;
+      const height = expanded ? 148 + Math.min(thread?.replies.length ?? 0, 12) * 64 : 148;
+      prefix[index + 1] = (prefix[index] ?? 0) + height;
+    }
+    return prefix;
+  }, [visibleThreads, expandedThreadIds]);
+
+  const [listWindow, setListWindow] = useState({ start: 0, end: 24 });
+  useEffect(() => {
+    const list = listRef.current;
+    if (!list) return;
+    const locate = (offset: number) => {
+      let low = 0;
+      let high = Math.max(0, threadOffsets.length - 2);
+      while (low < high) {
+        const mid = (low + high) >> 1;
+        if ((threadOffsets[mid + 1] ?? 0) <= offset) low = mid + 1;
+        else high = mid;
+      }
+      return low;
+    };
+    const update = () => {
+      if (visibleThreads.length <= 40) {
+        setListWindow((current) =>
+          current.start === 0 && current.end === visibleThreads.length
+            ? current
+            : { start: 0, end: visibleThreads.length },
+        );
+        return;
+      }
+      const start = Math.max(0, locate(list.scrollTop) - 3);
+      const end = Math.min(visibleThreads.length, locate(list.scrollTop + list.clientHeight) + 4);
+      setListWindow((current) =>
+        current.start === start && current.end === end ? current : { start, end },
+      );
+    };
+    update();
+    list.addEventListener('scroll', update, { passive: true });
+    const observer = new ResizeObserver(update);
+    observer.observe(list);
+    return () => {
+      list.removeEventListener('scroll', update);
+      observer.disconnect();
+    };
+  }, [visibleThreads.length, threadOffsets]);
+
+  const virtualized = visibleThreads.length > 40;
+  const windowStart = virtualized
+    ? Math.min(listWindow.start, visibleThreads.length)
+    : 0;
+  const windowEnd = virtualized
+    ? Math.min(visibleThreads.length, Math.max(windowStart, listWindow.end))
+    : visibleThreads.length;
+  const windowedThreads = virtualized
+    ? visibleThreads.slice(windowStart, windowEnd)
+    : visibleThreads;
+  const padTop = virtualized ? threadOffsets[windowStart] ?? 0 : 0;
+  const padBottom = virtualized
+    ? (threadOffsets[visibleThreads.length] ?? 0) - (threadOffsets[windowEnd] ?? 0)
+    : 0;
+
   const toggleThread = useCallback((id: string) => {
     setExpandedThreadIds((current) => {
       const next = new Set(current);
@@ -783,7 +852,7 @@ function CommentsPane({
                   })
                 : snapshot.truncated
                   ? fill(copy.stoppedAt, {
-                      count: MAX_FETCHED_COMMENTS.toLocaleString(language),
+                      count: snapshot.capturedCount.toLocaleString(language),
                     })
                   : formatCapturedAt(snapshot.capturedAt, language)
                     ? fill(copy.updatedAt, {
@@ -855,15 +924,20 @@ function CommentsPane({
       </div>
 
       <div className="comment-list" ref={listRef}>
+        {padTop > 0 && <div style={{ height: padTop }} />}
         <CommentThreadList
-          threads={visibleThreads}
+          threads={windowedThreads}
           query={searchQuery}
           expandedThreadIds={expandedThreadIds}
           emptyLabel={searchQuery ? copy.searchEmpty : copy.commentsArriving}
           onToggle={toggleThread}
-          canLoadMore={canLoadMore}
+          canLoadMore={canLoadMore && !virtualized}
           sentinelRef={sentinelRef}
         />
+        {padBottom > 0 && <div style={{ height: padBottom }} />}
+        {virtualized && canLoadMore && (
+          <div ref={sentinelRef} className="list-sentinel" />
+        )}
       </div>
     </section>
   );
@@ -1403,19 +1477,25 @@ function App() {
     setThreadError(null);
 
     try {
-      const response = (await browser.tabs.sendMessage(tabId, {
-        type: COMMENT_MESSAGES.getCommentsPage,
-        offset: 0,
-        limit: MAX_FETCHED_COMMENTS,
-        sortOrder: sortOrderRef.current,
-        hideFilteredComments: spamHidden,
-      })) as CommentsPageResponse;
-
-      if (response.videoId !== snapshot.videoId) return;
-
-      const rows = rowsForExport(
-        groupCommentsForDisplay(response.comments, sortOrderRef.current),
-      );
+      const rows: CommentExportRow[] = [];
+      let offset = 0;
+      let total = Number.POSITIVE_INFINITY;
+      while (offset < total) {
+        const response = (await browser.tabs.sendMessage(tabId, {
+          type: COMMENT_MESSAGES.getCommentsPage,
+          offset,
+          limit: MAX_COMMENT_PAGE_THREADS,
+          sortOrder: sortOrderRef.current,
+          hideFilteredComments: spamHidden,
+        })) as CommentsPageResponse;
+        if (response.videoId !== snapshot.videoId) return;
+        total = response.total;
+        const pageThreads = groupCommentsForDisplay(response.comments, sortOrderRef.current);
+        if (pageThreads.length === 0) break;
+        rows.push(...rowsForExport(pageThreads));
+        offset += pageThreads.length;
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      }
       if (rows.length === 0) {
         setThreadError(copy.noCommentsToExport);
         return;
@@ -1607,16 +1687,24 @@ function App() {
       if (state.kind !== 'ready') return;
 
       try {
-        const response = (await browser.tabs.sendMessage(state.tabId, {
-          type: COMMENT_MESSAGES.getCommentsPage,
-          offset: 0,
-          limit,
-          sortOrder: order,
-          hideFilteredComments: hideFilteredRef.current,
-        })) as CommentsPageResponse;
-        if (response.videoId !== state.snapshot.videoId) return;
-        if (response.sortOrder !== sortOrderRef.current) return;
-        setPageComments(response.comments);
+        const collected: YouTubeComment[] = [];
+        let offset = 0;
+        while (offset < limit) {
+          const response = (await browser.tabs.sendMessage(state.tabId, {
+            type: COMMENT_MESSAGES.getCommentsPage,
+            offset,
+            limit: Math.min(MAX_COMMENT_PAGE_THREADS, limit - offset),
+            sortOrder: order,
+            hideFilteredComments: hideFilteredRef.current,
+          })) as CommentsPageResponse;
+          if (response.videoId !== state.snapshot.videoId) return;
+          if (response.sortOrder !== sortOrderRef.current) return;
+          const got = groupCommentsForDisplay(response.comments, order).length;
+          collected.push(...response.comments);
+          if (got === 0 || offset + got >= response.total) break;
+          offset += got;
+        }
+        setPageComments(collected);
       } catch {
         // The popup can close or the tab can change while a page request is in flight.
       }
@@ -1633,6 +1721,9 @@ function App() {
       return;
     }
     if (visibleCountRef.current > COMMENTS_PAGE_SIZE) {
+      // Progress updates arrive continuously while a long thread loads.
+      // Refetch the scrolled prefix once that load settles.
+      if (state.snapshot.status === 'loading-all') return;
       void refreshVisibleComments(visibleCountRef.current);
       return;
     }
@@ -1646,26 +1737,30 @@ function App() {
     const visible = visibleCountRef.current;
     if (visible >= total) return;
 
-    const nextVisible = Math.min(visible + COMMENTS_PAGE_SIZE, total);
+    const pageSize = Math.min(COMMENTS_PAGE_SIZE, MAX_COMMENT_PAGE_THREADS);
     loadingMoreRef.current = true;
     try {
       const response = (await browser.tabs.sendMessage(state.tabId, {
         type: COMMENT_MESSAGES.getCommentsPage,
-        offset: 0,
-        limit: nextVisible,
+        offset: visible,
+        limit: pageSize,
         sortOrder: sortOrderRef.current,
         hideFilteredComments: hideFilteredRef.current,
       })) as CommentsPageResponse;
 
       if (response.videoId !== state.snapshot.videoId) return;
       if (response.sortOrder !== sortOrderRef.current) return;
-      if (response.comments.length === 0) {
+      const addedThreads = groupCommentsForDisplay(
+        response.comments,
+        sortOrderRef.current,
+      ).length;
+      if (addedThreads === 0) {
         setVisibleCount(Math.min(visible, total));
         return;
       }
 
-      setPageComments(response.comments);
-      setVisibleCount(Math.min(nextVisible, response.total));
+      setPageComments((current) => [...current, ...response.comments]);
+      setVisibleCount(Math.min(visible + addedThreads, response.total));
     } catch {
       // The popup can close or the tab can change while a page request is in flight.
     } finally {
@@ -1913,9 +2008,7 @@ function App() {
                       <p>
                         {autoSummarize
                           ? copy.autoSummarizeOn
-                          : fill(copy.summarizeIntro, {
-                              count: MAX_FETCHED_COMMENTS.toLocaleString(replyLanguage),
-                            })}
+                          : copy.summarizeIntro}
                       </p>
                       <button
                         className="summary-button"
@@ -1943,9 +2036,7 @@ function App() {
                           (state.kind === 'ready' &&
                             (state.snapshot.autoPhase === 'fetching' ||
                               state.snapshot.autoPhase === 'summarizing'))
-                            ? autoSummarize
-                              ? copy.runsInTab
-                              : copy.keepPopupOpen
+                            ? copy.runsInTab
                             : copy.takesSeconds}
                         </span>
                       </div>
@@ -1995,7 +2086,7 @@ function App() {
                           {!summaryUpdating &&
                             state.snapshot.truncated &&
                             ` • ${fill(copy.cappedAt, {
-                              count: MAX_FETCHED_COMMENTS.toLocaleString(replyLanguage),
+                              count: capturedCount(state.snapshot).toLocaleString(replyLanguage),
                             })}`}
                         </span>
                         <button

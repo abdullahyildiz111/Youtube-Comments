@@ -1,7 +1,18 @@
 import type { SavedSummary } from '@/lib/summary-cache';
 
-export const MAX_FETCHED_COMMENTS = 10_000;
+// A continuation bug must not loop forever. This is far above any real
+// comment thread the extension is expected to walk.
+export const CRAWL_COMMENT_FUSE = 500_000;
+export const CRAWL_PAGE_FUSE = 200_000;
 export const MAX_SNAPSHOT_COMMENTS = 50;
+export const MAX_COMMENT_PAGE_THREADS = 80;
+
+export const CRAWL_MESSAGES = {
+  start: 'comment-catcher:crawl-start',
+  cancel: 'comment-catcher:crawl-cancel',
+  batch: 'comment-catcher:crawl-batch',
+  pageFetch: 'comment-catcher:crawl-page-fetch',
+} as const;
 
 // YouTube's comments header offers exactly two orders. The labels and
 // descriptions below are the strings YouTube renders in its own sort menu.
@@ -101,6 +112,22 @@ export interface YouTubeComment {
   // The reply count YouTube reports in its Top listing, which excludes banned
   // and held replies. Only set on top-level comments the Top listing served.
   featuredReplyCount?: string | null;
+}
+
+// A later page can learn a rank, a pin, or a reply parent for a comment that
+// was already stored. Only the changed fields are sent.
+export interface CommentPatch {
+  id: string;
+  topRank?: number | null;
+  newestRank?: number | null;
+  replyRank?: number | null;
+  featured?: boolean;
+  featuredReplyCount?: string | null;
+  replyToId?: string | null;
+  isPinned?: boolean;
+  pinnedLabel?: string | null;
+  likeCount?: string | null;
+  replyCount?: string | null;
 }
 
 export interface CommentsSnapshot {
@@ -227,6 +254,142 @@ export function canonicalYouTubeCommentId(value: string | null | undefined): str
 export function parentCommentId(id: string): string | null {
   const separator = id.indexOf('.');
   return separator > 0 ? id.slice(0, separator) : null;
+}
+
+// The count printed on YouTube's own reply button ("229 yanıt", "1.2K replies").
+// Digits only, so "1,7 B" likes and other nearby labels do not qualify.
+export function pageReplyTotal(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const match = value.replace(/\s+/g, '').match(/^(\d[\d.]*)([KMB])?$/i);
+  if (!match?.[1]) return null;
+  const digits = match[1].replace(/[^\d]/g, '');
+  if (!digits || /^0+$/.test(digits)) return null;
+  return match[2] ? `${digits}${match[2].toUpperCase()}` : String(Number(digits));
+}
+
+// "Yanıtla" is the Reply action, not the "229 yanıt" total. The trailing
+// lookahead keeps that verb, and "replying", from being read as the count.
+const REPLY_WORD =
+  /(?:repl(?:ies|y)|yan[ıi]t(?:lar)?|respuestas?|r[eé]ponses?|antworten|rispost[ae]|respostas|reacties|svar|coment[aá]rios|回复|回覆|댓글)(?![\p{L}])/u;
+
+function compactReplyCount(raw: string, suffix?: string, turkish = false): string | null {
+  const amount = Number(raw.replace(',', '.'));
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  const unit = suffix?.toUpperCase();
+  // Turkish prints a thousand as "B" (bin). English uses B for a billion.
+  const scale =
+    unit === 'K' ? 1_000 : unit === 'M' ? 1_000_000 : unit === 'B' ? (turkish ? 1_000 : 1_000_000_000) : 1;
+  return String(Math.round(amount * scale));
+}
+
+// Pulls the reply-button total out of button copy. A reply word is required
+// once the string is longer than the button itself, so a like count nearby
+// ("1,7 B") is not treated as the reply total.
+export function replyButtonCountFromText(
+  value: string | null | undefined,
+  allowBare = false,
+): string | null {
+  const text = value?.replace(/\s+/g, ' ').trim() ?? '';
+  if (!text) return null;
+  // "2.2K Reply" is a like count sitting beside the Reply action. A magnitude
+  // suffix on the singular verb is not the thread total; "21 replies" is.
+  const labeled = new RegExp(
+    `(\\d[\\d.,]*)\\s*([KMB])?\\s+(${REPLY_WORD.source})`,
+    'giu',
+  );
+  let best: string | null = null;
+  let bestValue = 0;
+  for (const match of text.matchAll(labeled)) {
+    const word = match[3] ?? '';
+    const suffix = match[2];
+    if (suffix && /^(?:reply|yan[ıi]tla)$/i.test(word)) continue;
+    const turkish = /yan[ıi]t/i.test(word);
+    const count = compactReplyCount(match[1] ?? '', suffix, turkish);
+    const amount = count == null ? NaN : Number(count);
+    if (!Number.isFinite(amount) || amount <= bestValue) continue;
+    bestValue = amount;
+    best = count;
+  }
+  if (best) return best;
+  if (!allowBare || text.length > 40) return null;
+  const bare = text.match(/^(\d[\d.,]*)\s*([KMB])?$/i);
+  if (!bare?.[1]) return null;
+  return compactReplyCount(bare[1], bare[2]);
+}
+
+export function pageReplyCount(value: string | null | undefined): number | null {
+  // "229 yanıt" / "229 replies" is the label on the watch-page button. A bare
+  // "1,7 B" like count has no reply word and must stay out of this total.
+  const labeled = replyButtonCountFromText(value, false);
+  if (labeled) {
+    const amount = Number(labeled);
+    if (Number.isFinite(amount) && amount > 0) return amount;
+  }
+  const label = pageReplyTotal(value);
+  if (!label) return null;
+  const match = label.match(/^(\d+)([KMB])?$/i);
+  if (!match?.[1]) return null;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount)) return null;
+  const suffix = (match[2] || '').toUpperCase();
+  const scale =
+    suffix === 'K' ? 1_000 : suffix === 'M' ? 1_000_000 : suffix === 'B' ? 1_000_000_000 : 1;
+  return amount * scale;
+}
+
+// Hide spam keeps the replies behind YouTube's reply button. That button is
+// the size of the set, and the replies are the ones Top rendered. Replies only
+// Newest returned are the ones the page hides, so they are not used to pad a
+// short Top listing up to the button.
+export function selectShownReplies(
+  replies: YouTubeComment[],
+  pageCount: number | null,
+): YouTubeComment[] {
+  if (replies.length === 0) return replies;
+  const target = pageCount != null && pageCount > 0 ? pageCount : null;
+  const featured = replies.filter((reply) => reply.featured === true);
+  // Nothing was marked from Top, so there is no way to tell the page's
+  // replies from the ones it hides.
+  if (featured.length === 0) return replies;
+  if (target == null || target >= featured.length) {
+    if (featured.length === replies.length) return replies;
+    const ids = new Set(featured.map((reply) => reply.id));
+    return replies.filter((reply) => ids.has(reply.id));
+  }
+
+  const byRank = (left: YouTubeComment, right: YouTubeComment) => {
+    const leftRank = typeof left.replyRank === 'number' ? left.replyRank : Number.MAX_SAFE_INTEGER;
+    const rightRank = typeof right.replyRank === 'number' ? right.replyRank : Number.MAX_SAFE_INTEGER;
+    return leftRank - rightRank;
+  };
+  const ordered = featured.slice().sort(byRank);
+  const byId = new Map(replies.map((reply) => [reply.id, reply]));
+  const chosen = new Set<string>();
+  const consider = (reply: YouTubeComment) => {
+    if (chosen.size >= target || chosen.has(reply.id) || reply.featured !== true) return;
+    const chain: YouTubeComment[] = [];
+    let current: YouTubeComment | undefined = reply;
+    const seen = new Set<string>();
+    while (current && !chosen.has(current.id) && !seen.has(current.id)) {
+      seen.add(current.id);
+      if (current.featured === true) chain.push(current);
+      current = current.replyToId ? byId.get(current.replyToId) : undefined;
+    }
+    chain.reverse();
+    if (chain.length === 0 || chosen.size + chain.length > target) return;
+    for (const item of chain) chosen.add(item.id);
+  };
+
+  for (const reply of ordered) consider(reply);
+  if (chosen.size < target) {
+    for (const reply of ordered) {
+      if (chosen.size >= target) break;
+      chosen.add(reply.id);
+    }
+  }
+
+  if (chosen.size === 0) return replies.filter((reply) => reply.featured === true);
+  return replies.filter((reply) => chosen.has(reply.id));
 }
 
 export function threadParentId(comment: YouTubeComment): string | null {

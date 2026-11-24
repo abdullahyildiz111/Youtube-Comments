@@ -37,11 +37,15 @@ loadLocalEnv();
 const GEMINI_API_BASE =
   'https://generativelanguage.googleapis.com/v1beta/models';
 const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
-const MAX_REQUEST_CHARACTERS = 3_000_000;
-const MAX_COMMENTS = 10_000;
+const MAX_REQUEST_CHARACTERS = 24_000_000;
+const MAX_COMMENTS = 200_000;
+const GEMINI_REQUEST_GAP_MS = 4_000;
 const MAX_COMMENT_CHARACTERS = 10_000;
-const CHUNK_CHARACTERS = 36_000;
-const CHUNK_COMMENTS = 400;
+// Free-tier input is about 250,000 tokens per minute. 250,000 tokens is roughly
+// 750,000 characters, so a call stays near 600,000 characters of comment text.
+// A normal thread of a few thousand short comments is one call.
+const FREE_TIER_CALL_CHARACTERS = 600_000;
+const FREE_TIER_CALL_GAP_MS = 65_000;
 const MAX_QUESTION_CHARACTERS = 800;
 const MAX_HISTORY_TURNS = 12;
 const MAX_TURN_CHARACTERS = 2_000;
@@ -78,10 +82,12 @@ interface ChatRequest {
 
 interface GeminiResponse {
   candidates?: Array<{
+    finishReason?: string;
     content?: {
-      parts?: Array<{ text?: string }>;
+      parts?: Array<{ text?: string; thought?: boolean }>;
     };
   }>;
+  promptFeedback?: { blockReason?: string };
 }
 
 interface RateLimitBucket {
@@ -260,6 +266,13 @@ function geminiErrorResponse(
   error: unknown,
   kind: 'summary' | 'chat',
 ) {
+  if (error instanceof Error && error.message === 'GEMINI_DAILY_QUOTA') {
+    return context.json(
+      { error: 'The free AI quota for today is used up. Please try again tomorrow.' },
+      429,
+    );
+  }
+
   if (error instanceof Error && error.message === 'GEMINI_RATE_LIMITED') {
     return context.json(
       { error: 'The free AI service is busy. Please try again shortly.' },
@@ -275,13 +288,13 @@ function geminiErrorResponse(
   }
 
   console.error(kind === 'chat' ? 'Chat request failed' : 'Summary request failed', error);
+  const fallback =
+    kind === 'chat'
+      ? 'The AI service could not answer that question.'
+      : 'The AI service could not create a summary.';
+  const detail = error instanceof GeminiRequestError ? error.detail : '';
   return context.json(
-    {
-      error:
-        kind === 'chat'
-          ? 'The AI service could not answer that question.'
-          : 'The AI service could not create a summary.',
-    },
+    { error: detail ? `${fallback} ${detail}` : fallback },
     502,
   );
 }
@@ -450,30 +463,6 @@ function normalizeAnswer(value: string): string {
     .trim();
 }
 
-function chunkComments(comments: IncomingComment[]): IncomingComment[][] {
-  const chunks: IncomingComment[][] = [];
-  let current: IncomingComment[] = [];
-  let characters = 0;
-
-  for (const comment of comments) {
-    const nextSize = characters + comment.text.length;
-    if (
-      current.length > 0 &&
-      (current.length >= CHUNK_COMMENTS || nextSize > CHUNK_CHARACTERS)
-    ) {
-      chunks.push(current);
-      current = [];
-      characters = 0;
-    }
-
-    current.push(comment);
-    characters += comment.text.length;
-  }
-
-  if (current.length > 0) chunks.push(current);
-  return chunks;
-}
-
 function commentsBlock(comments: IncomingComment[], startIndex = 1): string {
   return comments
     .map(
@@ -615,6 +604,86 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
+class GeminiBusyError extends Error {
+  readonly delayMs: number;
+  readonly retry: boolean;
+
+  constructor(delayMs: number, retry = true) {
+    super('GEMINI_RATE_LIMITED');
+    this.name = 'GeminiBusyError';
+    this.delayMs = delayMs;
+    this.retry = retry;
+  }
+}
+
+class GeminiRequestError extends Error {
+  readonly detail: string;
+
+  constructor(detail: string) {
+    super('GEMINI_REQUEST_FAILED');
+    this.name = 'GeminiRequestError';
+    this.detail = detail;
+  }
+}
+
+// Free-tier Gemini quotas are per minute. Starting the next chunk as soon as
+// the previous one returns trips that limit on a long thread, so requests
+// leave a gap and share one pause when a 429 arrives.
+class GeminiThrottle {
+  private nextAt = 0;
+  private chain: Promise<void> = Promise.resolve();
+
+  take(): Promise<void> {
+    const ticket = this.chain.then(async () => {
+      while (this.nextAt > Date.now()) {
+        await sleep(this.nextAt - Date.now());
+      }
+      this.nextAt = Math.max(this.nextAt, Date.now() + GEMINI_REQUEST_GAP_MS);
+    });
+    this.chain = ticket.then(
+      () => undefined,
+      () => undefined,
+    );
+    return ticket;
+  }
+
+  pause(ms: number): void {
+    this.nextAt = Math.max(this.nextAt, Date.now() + ms);
+  }
+}
+
+const geminiThrottle = new GeminiThrottle();
+
+function quotedRetryDelayMs(response: Response, body: string): number | null {
+  const header = Number(response.headers.get('retry-after'));
+  if (Number.isFinite(header) && header > 0) return Math.round(header * 1_000);
+  const match = body.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/);
+  if (!match?.[1]) return null;
+  const seconds = Number(match[1]);
+  return Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds * 1_000) : null;
+}
+
+function geminiDailyQuota(body: string, delayMs: number | null): boolean {
+  if (/PerDay|per day|daily quota|requests per day/i.test(body)) return true;
+  return delayMs != null && delayMs >= 120_000;
+}
+
+function geminiTokenMinute(body: string): boolean {
+  return /token/i.test(body) && /minute|PerMinute/i.test(body);
+}
+
+function geminiErrorDetail(body: string): string {
+  try {
+    const parsed = JSON.parse(body) as { error?: { message?: string } };
+    const message = parsed.error?.message?.replace(/\s+/g, ' ').trim();
+    if (message) return message.slice(0, 180);
+  } catch {
+    const plain = body.replace(/\s+/g, ' ').trim();
+    if (plain) return plain.slice(0, 180);
+  }
+  return '';
+}
+
 async function generateGeminiText(
   prompt: string,
   model: string,
@@ -623,17 +692,23 @@ async function generateGeminiText(
 ): Promise<string> {
   let lastError: Error | null = null;
 
-  for (let attempt = 0; attempt < 4; attempt += 1) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
     try {
       return await requestGeminiText(prompt, model, languageName, format);
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
-      const timedOut = lastError.name === 'AbortError';
-      const rateLimited = lastError.message === 'GEMINI_RATE_LIMITED';
-      if ((!timedOut && !rateLimited) || (timedOut && attempt >= 1) || attempt === 3) {
-        throw lastError;
+      if (lastError.message === 'GEMINI_DAILY_QUOTA') throw lastError;
+      if (lastError.message === 'GEMINI_EMPTY_RESPONSE' && attempt < 1) continue;
+      if (error instanceof GeminiBusyError) {
+        if (!error.retry || attempt >= 1) throw new Error('GEMINI_RATE_LIMITED');
+        geminiThrottle.pause(error.delayMs);
+        continue;
       }
-      await sleep(timedOut ? 1_000 : 1_500 * 2 ** attempt);
+      if (lastError.name === 'AbortError' && attempt < 1) {
+        await sleep(1_000);
+        continue;
+      }
+      throw lastError;
     }
   }
 
@@ -662,8 +737,10 @@ async function requestGeminiText(
   languageName: string,
   format: 'paragraph' | 'answer',
 ): Promise<string> {
+  await geminiThrottle.take();
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+  const timeoutMs = Math.min(240_000, Math.max(GEMINI_TIMEOUT_MS, Math.ceil(prompt.length / 40_000) * 10_000));
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const languageRule = `Write every word of your response in ${languageName}.`;
   const systemText =
     format === 'answer'
@@ -692,7 +769,7 @@ async function requestGeminiText(
           generationConfig: {
             // Thought tokens count against this limit. A short cap makes the
             // model spend the whole request thinking and never return the paragraph.
-            maxOutputTokens: 2048,
+            maxOutputTokens: 8192,
             temperature: format === 'answer' ? 0.5 : 0.4,
             thinkingConfig: {
               thinkingLevel: 'MINIMAL',
@@ -710,23 +787,33 @@ async function requestGeminiText(
         console.error(details.slice(0, 500));
       }
 
-      if (response.status === 429) {
-        throw new Error('GEMINI_RATE_LIMITED');
+      if (response.status === 429 || response.status === 503) {
+        const delayMs = quotedRetryDelayMs(response, details);
+        if (geminiDailyQuota(details, delayMs)) throw new Error('GEMINI_DAILY_QUOTA');
+        if (geminiTokenMinute(details)) throw new GeminiBusyError(60_000, false);
+        throw new GeminiBusyError(
+          Math.min(90_000, Math.max(60_000, delayMs ?? (response.status === 503 ? 20_000 : 60_000))),
+        );
       }
 
-      throw new Error('GEMINI_REQUEST_FAILED');
+      throw new GeminiRequestError(geminiErrorDetail(details));
     }
 
     const payload = (await response.json()) as GeminiResponse;
-    const raw =
-      payload.candidates?.[0]?.content?.parts
-        ?.map((part) => part.text ?? '')
-        .join(' ') ?? '';
+    const parts = payload.candidates?.[0]?.content?.parts ?? [];
+    const visible = parts.filter((part) => part.thought !== true);
+    const raw = (visible.length > 0 ? visible : parts)
+      .map((part) => part.text ?? '')
+      .join(' ');
     const text =
       format === 'answer' ? normalizeAnswer(raw) : normalizeParagraph(raw);
 
     if (!text) {
-      console.error('Gemini returned no text');
+      const reason =
+        payload.candidates?.[0]?.finishReason ||
+        payload.promptFeedback?.blockReason ||
+        'no text';
+      console.error('Gemini returned no text', reason);
       throw new Error('GEMINI_EMPTY_RESPONSE');
     }
 
@@ -736,11 +823,33 @@ async function requestGeminiText(
   }
 }
 
+function packForQuota(comments: IncomingComment[]): IncomingComment[][] {
+  const chunks: IncomingComment[][] = [];
+  let current: IncomingComment[] = [];
+  let characters = 0;
+  for (const comment of comments) {
+    const size = comment.text.length + 32;
+    if (current.length > 0 && characters + size > FREE_TIER_CALL_CHARACTERS) {
+      chunks.push(current);
+      current = [];
+      characters = 0;
+    }
+    current.push(comment);
+    characters += size;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+async function waitForQuotaWindow(callIndex: number): Promise<void> {
+  if (callIndex > 0) await sleep(FREE_TIER_CALL_GAP_MS);
+}
+
 async function requestGeminiSummary(
   request: SummaryRequest,
 ): Promise<{ summary: string; model: string }> {
   const model = resolvedModel();
-  const chunks = chunkComments(request.comments);
+  const chunks = packForQuota(request.comments);
   if (chunks.length <= 1) {
     return {
       summary: await generateParagraph(buildPrompt(request), model, request.languageName),
@@ -749,8 +858,12 @@ async function requestGeminiSummary(
   }
 
   const partials: string[] = [];
-  let startIndex = 1;
-  for (const [index, chunk] of chunks.entries()) {
+  for (let index = 0; index < chunks.length; index += 1) {
+    await waitForQuotaWindow(index);
+    const chunk = chunks[index];
+    if (!chunk) continue;
+    const startIndex =
+      chunks.slice(0, index).reduce((sum, item) => sum + item.length, 0) + 1;
     partials.push(
       await generateParagraph(
         buildChunkPrompt(request, chunk, index, chunks.length, startIndex),
@@ -758,9 +871,9 @@ async function requestGeminiSummary(
         request.languageName,
       ),
     );
-    startIndex += chunk.length;
   }
 
+  await waitForQuotaWindow(partials.length);
   return {
     summary: await generateParagraph(
       buildMergePrompt(request, partials),
@@ -775,7 +888,7 @@ async function requestGeminiChat(
   request: ChatRequest,
 ): Promise<{ answer: string; model: string }> {
   const model = resolvedModel();
-  const chunks = chunkComments(request.comments);
+  const chunks = packForQuota(request.comments);
 
   if (chunks.length <= 1) {
     return {
@@ -789,17 +902,21 @@ async function requestGeminiChat(
   }
 
   const notes: string[] = [];
-  let startIndex = 1;
-  for (const [index, chunk] of chunks.entries()) {
+  for (let index = 0; index < chunks.length; index += 1) {
+    await waitForQuotaWindow(index);
+    const chunk = chunks[index];
+    if (!chunk) continue;
+    const startIndex =
+      chunks.slice(0, index).reduce((sum, item) => sum + item.length, 0) + 1;
     const note = await generateAnswer(
       buildChatChunkPrompt(request, chunk, index, chunks.length, startIndex),
       model,
       request.languageName,
     );
-    startIndex += chunk.length;
     if (!/^none\.?$/i.test(note)) notes.push(note);
   }
 
+  await waitForQuotaWindow(1);
   if (notes.length === 0) {
     return {
       answer: await generateAnswer(
