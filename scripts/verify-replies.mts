@@ -4,11 +4,13 @@
 //
 //   npx tsx scripts/verify-replies.mts <videoId> [--hl=en] [--threads=5]
 //     [--record=file.json] [--replay=file.json] [--flaky=0.05] [--dead=0.01]
+//     [--interval=400]
 //
 // --record saves every raw /next response so --replay can rerun the store
 // logic offline. --flaky fails that share of continuations once each, which
 // the crawl must recover from. --dead fails that share every time, which
-// the crawl must report as truncated.
+// the crawl must report as truncated. --interval is the minimum spacing
+// between live requests in milliseconds.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { CommentStore, type CommentView } from '../lib/comment-store.ts';
 import type { CommentPatch, YouTubeComment } from '../lib/comments.ts';
@@ -40,7 +42,7 @@ if (replayPath) {
   };
 } else {
   const session = await openSession(videoId, hl);
-  const client = makeNext(session, hl);
+  const client = makeNext(session, hl, Number(flag('interval') ?? 400));
   requestCount = client.requestCount;
   fetchPage = async (token, ctp, sort) => {
     const data = await client.next({
