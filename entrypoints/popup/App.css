@@ -1283,6 +1283,36 @@ footer {
   white-space: nowrap;
 }
 
+.debug-switch {
+  margin-top: 4px;
+}
+
+.debug-replies {
+  width: min(100%, 320px);
+  margin-top: 6px;
+  text-align: left;
+}
+
+.debug-replies-actions {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.debug-replies-report {
+  max-height: 160px;
+  margin: 0;
+  padding: 8px;
+  overflow: auto;
+  border: 1px solid #2a2a30;
+  border-radius: 8px;
+  background: #121217;
+  color: #d7d7de;
+  font-size: 10px;
+  line-height: 1.35;
+  white-space: pre;
+}
+
 .comment-toolbar {
   flex-shrink: 0;
   box-sizing: border-box;

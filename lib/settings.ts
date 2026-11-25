@@ -6,6 +6,7 @@ export const AUTO_SUMMARIZE_KEY = 'comment-catcher:auto-summarize';
 // Fresh key: ON shows replies YouTube's Top view leaves out. Default OFF
 // matches the counts on the watch page.
 export const SHOW_SPAM_KEY = 'comment-catcher:show-spam-comments';
+export const DEBUG_REPLIES_KEY = 'comment-catcher:debug-replies';
 export const REPLY_LANGUAGE_KEY = 'comment-catcher:reply-language';
 
 export async function getAutoSummarizeEnabled(): Promise<boolean> {
@@ -27,6 +28,17 @@ export async function getShowSpamComments(): Promise<boolean> {
 export async function setShowSpamComments(enabled: boolean): Promise<void> {
   await browser.storage.local.set({
     [SHOW_SPAM_KEY]: enabled,
+  });
+}
+
+export async function getDebugRepliesEnabled(): Promise<boolean> {
+  const stored = await browser.storage.local.get(DEBUG_REPLIES_KEY);
+  return stored[DEBUG_REPLIES_KEY] === true;
+}
+
+export async function setDebugRepliesEnabled(enabled: boolean): Promise<void> {
+  await browser.storage.local.set({
+    [DEBUG_REPLIES_KEY]: enabled,
   });
 }
 

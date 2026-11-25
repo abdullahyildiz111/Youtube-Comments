@@ -19,6 +19,20 @@ export interface CommentView {
   canFilter: boolean;
 }
 
+export interface ThreadReplyDiagnostics {
+  id: string;
+  author: string;
+  button: string | null;
+  buttonCount: number | null;
+  toolbar: string | null;
+  loaded: number;
+  topServed: number;
+  newestOnly: number;
+  keptOff: number;
+  hiddenOff: number;
+  parentFeatured: boolean;
+}
+
 // The comments collected for one video, and the threads the panel lists from
 // them. With Show spam off (hideFiltered), each thread matches YouTube's Top
 // reply button. With Show spam on, Newest extras stay. Top-level comments are
@@ -173,13 +187,39 @@ export class CommentStore {
     return hidden;
   }
 
+  // Per-thread reply membership for debugging Show spam / YouTube parity.
+  replyDiagnostics(limit = 12): ThreadReplyDiagnostics[] {
+    const out: ThreadReplyDiagnostics[] = [];
+    for (const id of this.order.rootIds('top', this.isRoot, limit)) {
+      const parent = this.comments.get(id);
+      if (!parent) continue;
+      const replies = this.order.replies(id, this.comments);
+      const topServed = replies.filter((reply) => reply.featured === true).length;
+      const kept = this.shownReplies(parent, replies);
+      out.push({
+        id: parent.id,
+        author: parent.author,
+        button: parent.featuredReplyCount ?? null,
+        buttonCount: pageReplyCount(parent.featuredReplyCount),
+        toolbar: parent.replyCount ?? null,
+        loaded: replies.length,
+        topServed,
+        newestOnly: replies.length - topServed,
+        keptOff: kept.length,
+        hiddenOff: replies.length - kept.length,
+        parentFeatured: parent.featured === true,
+      });
+    }
+    return out;
+  }
+
   private readonly isRoot = (id: string): boolean => {
     const comment = this.comments.get(id);
     return Boolean(comment && !comment.isReply);
   };
 
   // A thread Top never served has no Top view to match, so all of its
-  // replies stay.
+  // replies stay. Otherwise match the watch-page button total.
   private shownReplies(parent: YouTubeComment, replies: YouTubeComment[]): YouTubeComment[] {
     if (!parent.featured) return replies;
     return selectShownReplies(replies, pageReplyCount(parent.featuredReplyCount));

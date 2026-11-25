@@ -4,5 +4,5 @@
     "allowImportingTsExtensions": true,
     "jsx": "react-jsx"
   },
-  "exclude": ["backend"]
+  "exclude": ["backend", "scripts"]
 }

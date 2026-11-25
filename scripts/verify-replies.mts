@@ -3,15 +3,17 @@
 // then runs the panel's CommentStore. Prints reply counts with Show spam off
 // (YouTube parity) and on (extras) next to YouTube's own Top button totals.
 //
-//   npx tsx scripts/verify-replies.mts <videoId> [--hl=en] [--threads=5]
+//   npx tsx scripts/verify-replies.mts <videoId> [--hl=tr] [--gl=TR] [--threads=5]
 //     [--record=file.json] [--replay=file.json] [--flaky=0.05] [--dead=0.01]
-//     [--interval=400]
+//     [--interval=400] [--browser-pace]
 //
 // --record saves every raw /next response so --replay can rerun the store
 // logic offline. --flaky fails that share of continuations once each, which
 // the crawl must recover from. --dead fails that share every time, which
-// the crawl must report as truncated. --interval is the minimum spacing
-// between live requests in milliseconds.
+// the crawl must report as truncated. --interval is extra spacing on top of
+// the crawler's own 120ms gap. --browser-pace sets interval=0 so only the
+// crawler gap applies (closest to the extension path). Match the user's
+// YouTube locale with --hl=tr --gl=TR.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { CommentStore, type CommentView } from '../lib/comment-store.ts';
 import type { CommentPatch, YouTubeComment } from '../lib/comments.ts';
@@ -20,14 +22,23 @@ import { makeNext, openSession } from './yt-session.ts';
 
 const args = process.argv.slice(2);
 const flag = (name: string) => args.find((arg) => arg.startsWith(`--${name}=`))?.split('=')[1];
+const hasFlag = (name: string) => args.includes(`--${name}`);
 const videoId = args.find((arg) => !arg.startsWith('--'));
-if (!videoId) throw new Error('usage: verify-replies.mts <videoId> [--hl=en] [--threads=5]');
+if (!videoId) {
+  throw new Error(
+    'usage: verify-replies.mts <videoId> [--hl=tr] [--gl=TR] [--browser-pace]',
+  );
+}
 const hl = flag('hl') ?? 'en';
+const gl = flag('gl') ?? (hl === 'tr' ? 'TR' : 'US');
 const threadLimit = Number(flag('threads') ?? 5);
 const recordPath = flag('record');
 const replayPath = flag('replay');
 const flakyRate = Number(flag('flaky') ?? 0);
 const deadRate = Number(flag('dead') ?? 0);
+const intervalMs = hasFlag('browser-pace')
+  ? 0
+  : Number(flag('interval') ?? 400);
 
 type Sort = 'top' | 'newest' | 'none';
 const recorded: Record<string, unknown> = replayPath
@@ -43,7 +54,7 @@ if (replayPath) {
   };
 } else {
   const session = await openSession(videoId, hl);
-  const client = makeNext(session, hl, Number(flag('interval') ?? 400));
+  const client = makeNext(session, hl, intervalMs, gl);
   requestCount = client.requestCount;
   fetchPage = async (token, ctp, sort) => {
     const data = await client.next({
@@ -141,7 +152,12 @@ const parityListed = listed(parity);
 const extrasListed = listed(extras);
 const doubleDelivered = [...delivered.values()].filter((times) => times > 1).length;
 
-console.log(`## ${videoId} (hl=${hl})`);
+console.log(`## ${videoId} (hl=${hl} gl=${gl} interval=${intervalMs})`);
+for (const row of store.replyDiagnostics(threadLimit)) {
+  console.log(
+    `diag ${row.author} button=${row.button} toolbar=${row.toolbar} loaded=${row.loaded} top=${row.topServed} newestOnly=${row.newestOnly} keptOff=${row.keptOff} hiddenOff=${row.hiddenOff}`,
+  );
+}
 console.log(
   JSON.stringify({
     header: result.totalCommentsLabel,

@@ -44,8 +44,10 @@ import {
 import { isReplyLanguageCode } from '@/lib/languages';
 import {
   AUTO_SUMMARIZE_KEY,
+  DEBUG_REPLIES_KEY,
   SHOW_SPAM_KEY,
   getAutoSummarizeEnabled,
+  getDebugRepliesEnabled,
   getShowSpamComments,
   getReplyLanguage,
 } from '@/lib/settings';
@@ -342,6 +344,7 @@ export default defineContentScript({
     let sortOrder: CommentSortOrder = DEFAULT_COMMENT_SORT_ORDER;
     // Default matches the watch page (extras hidden). Show spam turns this off.
     let hideFilteredComments = true;
+    let debugReplies = false;
     // True once YouTube's own ranking is in the store. Page order is only a
     // stand-in until then, and mixing the two scales would scramble the list.
     let hasFetchedRanks = false;
@@ -504,6 +507,46 @@ export default defineContentScript({
         if (index > 0 && index % 300 === 0) await yieldToUi();
       }
       return listed;
+    };
+
+    const buildReplyDiagnostics = (limit = 12) => {
+      const view = currentView();
+      return {
+        videoId: activeVideoId,
+        fetchedAll,
+        truncated,
+        capturedCount: comments.size,
+        totalCommentsLabel,
+        showSpam: !hideFilteredComments,
+        canFilter: view.canFilter,
+        extrasHidden: store.hiddenCount({ ...view, hideFiltered: true }),
+        threads: store.replyDiagnostics(limit),
+      };
+    };
+
+    const publishDiagnostics = (report: ReturnType<typeof buildReplyDiagnostics>) => {
+      try {
+        (window as Window & { __commentCatcherDiagnostics?: unknown }).__commentCatcherDiagnostics =
+          report;
+        // Also mirror into the DOM so Playwright / page.evaluate can read it
+        // from the page world (content-script window bindings stay isolated).
+        let node = document.getElementById(
+          'comment-catcher-diagnostics',
+        ) as HTMLScriptElement | null;
+        if (!node) {
+          node = document.createElement('script');
+          node.id = 'comment-catcher-diagnostics';
+          node.type = 'application/json';
+          node.setAttribute('data-comment-catcher', 'diagnostics');
+          document.documentElement.appendChild(node);
+        }
+        node.textContent = JSON.stringify(report);
+        if (debugReplies) {
+          console.info('[Comment Catcher] reply diagnostics', report);
+        }
+      } catch {
+        // Page may deny the assignment; the message response still returns it.
+      }
     };
 
     const getSnapshot = (): CommentsSnapshot => {
@@ -1002,6 +1045,7 @@ export default defineContentScript({
         capturedAt = comments.size > 0 ? new Date().toISOString() : capturedAt;
         status = comments.size > 0 ? 'ready' : 'no-comments';
         publishUpdateNow();
+        publishDiagnostics(buildReplyDiagnostics());
         return {
           ok: comments.size > 0 || Boolean(result?.ok),
           count: comments.size,
@@ -1139,6 +1183,7 @@ export default defineContentScript({
             applyListedCommentCount(data.totalCommentsLabel);
             status = comments.size > 0 ? 'ready' : 'no-comments';
             publishUpdate();
+            publishDiagnostics(buildReplyDiagnostics());
             finish({
               ok: true,
               count: comments.size,
@@ -1636,6 +1681,17 @@ export default defineContentScript({
         );
       }
 
+      if (request.type === COMMENT_MESSAGES.getReplyDiagnostics) {
+        if (window !== window.top) return undefined;
+        const limit = Math.min(
+          40,
+          Math.max(1, Math.floor(request.limit ?? 12) || 12),
+        );
+        const report = buildReplyDiagnostics(limit);
+        publishDiagnostics(report);
+        return Promise.resolve(report);
+      }
+
       return undefined;
     };
 
@@ -1650,6 +1706,10 @@ export default defineContentScript({
       if (SHOW_SPAM_KEY in changes) {
         hideFilteredComments = changes[SHOW_SPAM_KEY]?.newValue !== true;
         publishUpdate();
+      }
+      if (DEBUG_REPLIES_KEY in changes) {
+        debugReplies = changes[DEBUG_REPLIES_KEY]?.newValue === true;
+        if (debugReplies) publishDiagnostics(buildReplyDiagnostics());
       }
 
       if (!(AUTO_SUMMARIZE_KEY in changes)) return;
@@ -1780,6 +1840,15 @@ export default defineContentScript({
     void getShowSpamComments().then((showSpam) => {
       hideFilteredComments = !showSpam;
       publishUpdate();
+    });
+    void getDebugRepliesEnabled().then((enabled) => {
+      debugReplies = enabled;
+      if (debugReplies) publishDiagnostics(buildReplyDiagnostics());
+    });
+
+    // Playwright / page scripts can request a fresh dump without the popup.
+    ctx.addEventListener(window, 'comment-catcher:request-diagnostics', () => {
+      publishDiagnostics(buildReplyDiagnostics());
     });
   },
 });

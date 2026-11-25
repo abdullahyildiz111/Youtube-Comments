@@ -60,7 +60,12 @@ export async function openSession(videoId: string, hl = 'en'): Promise<NodeSessi
 // Requests are spaced out because a burst from one IP gets it blocked
 // ("Sorry..." page on every endpoint) for a long while. About 3,500 requests
 // in 25 minutes at 150ms spacing was enough to trigger it.
-export function makeNext(session: NodeSession, hl = 'en', minIntervalMs = 400) {
+export function makeNext(
+  session: NodeSession,
+  hl = 'en',
+  minIntervalMs = 400,
+  gl = 'US',
+) {
   let requests = 0;
   let refused = 0;
   let nextSlot = 0;
@@ -90,7 +95,7 @@ export function makeNext(session: NodeSession, hl = 'en', minIntervalMs = 400) {
               clientName: 'WEB',
               clientVersion: session.clientVersion,
               hl,
-              gl: 'US',
+              gl,
               visitorData: session.visitorData,
             },
           },
