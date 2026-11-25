@@ -12,18 +12,17 @@ import {
 
 export interface CommentView {
   sortOrder: CommentSortOrder;
+  // True when Show spam is off: trim each thread to YouTube's Top view.
   hideFiltered: boolean;
-  // Hiding needs both listings walked to the end. On a partial or truncated
+  // Trimming needs both listings walked to the end. On a partial or truncated
   // load a reply missing from Top may just be one the Top pass never reached.
   canFilter: boolean;
 }
 
 // The comments collected for one video, and the threads the panel lists from
-// them. "Spam" here is what YouTube's own Top view of a thread leaves out:
-// the reply button under a thread counts only the replies Top serves, while
-// the Newest listing and the comment header count more. Top-level comments
-// are never hidden. Top's top-level listing is a ranking that stops early,
-// so a comment it does not reach is not one YouTube filtered.
+// them. With Show spam off (hideFiltered), each thread matches YouTube's Top
+// reply button. With Show spam on, Newest extras stay. Top-level comments are
+// never removed: Top's top-level listing is a ranking that stops early.
 export class CommentStore {
   readonly comments = new Map<string, YouTubeComment>();
   // Reply totals read off the watch page. The crawl must not replace them
@@ -158,7 +157,7 @@ export class CommentStore {
     return threads;
   }
 
-  // How many loaded comments Hide spam takes out of the list.
+  // How many loaded comments Show spam off takes out of the list.
   hiddenCount(view: CommentView): number {
     if (!view.canFilter) return 0;
     const key = `${this.revision}`;

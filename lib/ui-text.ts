@@ -73,9 +73,9 @@ export interface UiCopy {
   stoppedAt: string;
   updatedAt: string;
   updatesAsLoad: string;
-  hideSpam: string;
-  hideSpamTitle: string;
-  hideSpamUnavailable: string;
+  showSpam: string;
+  showSpamTitle: string;
+  showSpamUnavailable: string;
   spamHidden: string;
   exportCsv: string;
   exportPdf: string;
@@ -215,18 +215,18 @@ const EN: UiCopy = {
   stoppedAt: 'Stopped at {count} comments',
   updatedAt: 'Updated {time}',
   updatesAsLoad: 'Updates as comments load',
-  hideSpam: 'Hide spam',
-  hideSpamTitle:
-    'Hide the replies YouTube’s Top view leaves out of a thread, so each thread matches the reply count YouTube shows. Top-level comments always stay.',
-  hideSpamUnavailable:
-    'Load the whole thread first. Until then a comment missing from Top may simply be one the Top pass has not reached yet.',
-  spamHidden: '{count} spam hidden',
+  showSpam: 'Show spam',
+  showSpamTitle:
+    'Also show the replies YouTube’s Top view leaves out of a thread. Off matches the reply counts on the watch page. Top-level comments are always listed.',
+  showSpamUnavailable:
+    'Load the whole thread first. Until then a reply missing from Top may simply be one the Top pass has not reached yet.',
+  spamHidden: '{count} extra comments',
   exportCsv: 'Export CSV',
   exportPdf: 'Export PDF',
   exporting: 'Exporting…',
   exportCsvTitle:
-    'Download the loaded comments as a spreadsheet. Hide spam applies.',
-  exportPdfTitle: 'Download the loaded comments as a PDF. Hide spam applies.',
+    'Download the loaded comments as a spreadsheet. Show spam applies.',
+  exportPdfTitle: 'Download the loaded comments as a PDF. Show spam applies.',
   loadAll: 'Load all',
   loadingShort: 'Loading…',
   jumpToPage: 'Jump to page',

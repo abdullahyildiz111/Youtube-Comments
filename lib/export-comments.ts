@@ -92,7 +92,7 @@ export function commentsToCsv(
   rows: CommentExportRow[],
   meta: CommentExportMeta,
 ): string {
-  const spam = meta.spamHidden ? 'Hidden' : 'Shown';
+  const spam = meta.spamHidden ? 'Extras hidden' : 'Extras shown';
   const header = [
     'Video title',
     'Video URL',
@@ -431,7 +431,7 @@ export async function commentsToPdf(
   const details = [
     meta.channelName,
     meta.sortLabel,
-    meta.spamHidden ? 'Spam hidden' : 'Spam shown',
+    meta.spamHidden ? 'Extras hidden' : 'Extras shown',
     scopeLabel(meta),
     `${rows.length.toLocaleString()} comments`,
     meta.exportedAt.toLocaleString(),

@@ -1,6 +1,7 @@
-// Crawls a real video with the extension's own crawler and comment store, and
-// prints what the panel lists with Hide spam on and off next to the reply
-// counts YouTube's own Top listing reports.
+// Crawls a real video with the same fetchAllVideoComments entry point the
+// extension background crawl uses (lib/comment-crawl.ts → innertube-comments),
+// then runs the panel's CommentStore. Prints reply counts with Show spam off
+// (YouTube parity) and on (extras) next to YouTube's own Top button totals.
 //
 //   npx tsx scripts/verify-replies.mts <videoId> [--hl=en] [--threads=5]
 //     [--record=file.json] [--replay=file.json] [--flaky=0.05] [--dead=0.01]
@@ -113,8 +114,13 @@ if (recordPath) writeFileSync(recordPath, JSON.stringify(recorded));
 
 const all = [...store.comments.values()];
 const roots = all.filter((comment) => !comment.isReply);
-const on: CommentView = { sortOrder: 'top', hideFiltered: true, canFilter: !result.truncated };
-const off: CommentView = { ...on, hideFiltered: false };
+// Show spam OFF = YouTube parity (trim to Top). Show spam ON = extras too.
+const parity: CommentView = {
+  sortOrder: 'top',
+  hideFiltered: true,
+  canFilter: !result.truncated,
+};
+const extras: CommentView = { ...parity, hideFiltered: false };
 const listed = (view: CommentView) => {
   let replies = 0;
   const seen = new Set<string>();
@@ -131,8 +137,8 @@ const listed = (view: CommentView) => {
   }
   return { roots: ids.length, replies, total: ids.length + replies, repeats };
 };
-const onListed = listed(on);
-const offListed = listed(off);
+const parityListed = listed(parity);
+const extrasListed = listed(extras);
 const doubleDelivered = [...delivered.values()].filter((times) => times > 1).length;
 
 console.log(`## ${videoId} (hl=${hl})`);
@@ -144,31 +150,41 @@ console.log(
     requests: requestCount(),
     injectedFailures: injected,
     deadTokens: dead.size,
-    maxFetchesPerToken: Math.max(0, ...[...attempts].filter(([key]) => !key.startsWith('seen|')).map(([, count]) => count)),
+    maxFetchesPerToken: Math.max(
+      0,
+      ...[...attempts]
+        .filter(([key]) => !key.startsWith('seen|'))
+        .map(([, count]) => count),
+    ),
     seconds: Math.round((Date.now() - started) / 1000),
     roots: roots.length,
     replies: all.length - roots.length,
     topServedRoots: roots.filter((comment) => comment.featured).length,
     moderatedFlagThreads: moderated,
     doubleDelivered,
-    repeatedRepliesOn: onListed.repeats,
-    repeatedRepliesOff: offListed.repeats,
+    repeatedRepliesParity: parityListed.repeats,
+    repeatedRepliesExtras: extrasListed.repeats,
   }),
 );
 console.log('');
-console.log('| Thread | YouTube (Top button) | Newest toolbar | Hide spam ON | Hide spam OFF |');
+console.log(
+  '| Thread | YouTube (Top button) | Newest toolbar | Show spam OFF | Show spam ON |',
+);
 console.log('|---|---:|---:|---:|---:|');
 const byButton = roots
-  .map((root) => ({ root, total: Number((buttonTotals.get(root.id) ?? '').replace(/[^\d]/g, '')) || 0 }))
+  .map((root) => ({
+    root,
+    total: Number((buttonTotals.get(root.id) ?? '').replace(/[^\d]/g, '')) || 0,
+  }))
   .sort((left, right) => right.total - left.total)
   .slice(0, threadLimit);
 for (const { root } of byButton) {
   const name = `${root.author} ${root.id.slice(0, 8)}`;
   console.log(
-    `| ${name} | ${buttonTotals.get(root.id) ?? '-'} | ${root.replyCount ?? '-'} | ${store.thread(root.id, on)?.replies.length ?? 0} | ${store.thread(root.id, off)?.replies.length ?? 0} |`,
+    `| ${name} | ${buttonTotals.get(root.id) ?? '-'} | ${root.replyCount ?? '-'} | ${store.thread(root.id, parity)?.replies.length ?? 0} | ${store.thread(root.id, extras)?.replies.length ?? 0} |`,
   );
 }
 console.log('');
 console.log(
-  `Top-level: ON ${onListed.roots} / OFF ${offListed.roots}. Comments listed: ON ${onListed.total} / OFF ${offListed.total}. Spam hidden: ${store.hiddenCount(on)}.`,
+  `Top-level: OFF ${parityListed.roots} / ON ${extrasListed.roots}. Comments listed: OFF ${parityListed.total} / ON ${extrasListed.total}. Extra comments hidden: ${store.hiddenCount(parity)}.`,
 );

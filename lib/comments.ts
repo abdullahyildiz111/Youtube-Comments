@@ -337,10 +337,10 @@ export function pageReplyCount(value: string | null | undefined): number | null 
   return amount * scale;
 }
 
-// Hide spam keeps the replies behind YouTube's reply button. That button is
-// the size of the set, and the replies are the ones Top rendered. Replies only
-// Newest returned are the ones the page hides, so they are not used to pad a
-// short Top listing up to the button.
+// Show spam off keeps the replies behind YouTube's reply button. That button
+// is the size of the set, and the replies are the ones Top rendered. Replies
+// only Newest returned are the ones the page hides, so they are not used to
+// pad a short Top listing up to the button.
 export function selectShownReplies(
   replies: YouTubeComment[],
   pageCount: number | null,
