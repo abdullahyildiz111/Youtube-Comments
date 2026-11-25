@@ -28,6 +28,11 @@ const REPLY_CONCURRENCY = 6;
 const RATE_LIMIT_ATTEMPTS = 12;
 const TOKEN_ATTEMPTS = 5;
 const STALE_CHAIN_PAGES = 3;
+// Space starts so the browser path does not burst 8 requests at once. The
+// Node verification script used to be the only paced caller, and YouTube
+// answered it completely; the extension's unpaced bursts stopped early
+// around 4,200 of 4,600 comments on the same video.
+const FETCH_GAP_MS = 120;
 
 // Captured before YouTube wraps fetch. A wrapped fetch applies the response
 // to the open comments section, so a Newest request would switch the page's
@@ -1684,6 +1689,14 @@ export async function fetchAllVideoComments(
   let gaveUp = false;
   let rateStrikes = 0;
   let pausedUntil = 0;
+  let nextFetchAt = 0;
+
+  const paceFetch = async (): Promise<void> => {
+    const now = Date.now();
+    const slot = Math.max(now, nextFetchAt);
+    nextFetchAt = slot + FETCH_GAP_MS;
+    if (slot > now) await pauseCrawl(slot - now, stillHere);
+  };
 
   // Positions YouTube gave each comment, per order. Walking both listings is
   // the only way to reproduce "Top", and it also tells us which comments
@@ -1842,13 +1855,27 @@ export async function fetchAllVideoComments(
     return changed ? patch : null;
   };
 
+  const safeProgress = async (
+    count: number,
+    label?: string | null,
+    added?: YouTubeComment[],
+    patches?: CommentPatch[],
+  ) => {
+    try {
+      await onProgress(count, label, added, patches);
+    } catch {
+      // The UI or message channel may be briefly unavailable. Losing one
+      // progress tick is better than aborting a multi-thousand-comment crawl.
+    }
+  };
+
   if (pageQueue.length === 0 && replyQueue.length === 0) {
     throw new Error(
       'Could not find YouTube comment data. Refresh the video page, then try again.',
     );
   }
 
-  await onProgress(held.size, totalCommentsLabel);
+  await safeProgress(held.size, totalCommentsLabel);
 
   let pages = 0;
 
@@ -1874,6 +1901,8 @@ export async function fetchAllVideoComments(
         if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
           await new Promise((resolve) => setTimeout(resolve, 0));
         }
+        await paceFetch();
+        if (!stillHere() || gaveUp) return;
         data = fetchPage
           ? await fetchPage(next.token, next.clickTrackingParams, next.sort)
           : await fetchInnertube(
@@ -2006,7 +2035,7 @@ export async function fetchAllVideoComments(
     }
 
     if (added.length > 0 || patches.length > 0 || parsed.totalCommentsLabel) {
-      await onProgress(held.size, totalCommentsLabel, added, patches);
+      await safeProgress(held.size, totalCommentsLabel, added, patches);
     }
   };
 

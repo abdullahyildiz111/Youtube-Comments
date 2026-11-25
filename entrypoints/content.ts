@@ -44,9 +44,9 @@ import {
 import { isReplyLanguageCode } from '@/lib/languages';
 import {
   AUTO_SUMMARIZE_KEY,
-  HIDE_FILTERED_KEY,
+  SHOW_SPAM_KEY,
   getAutoSummarizeEnabled,
-  getHideFilteredComments,
+  getShowSpamComments,
   getReplyLanguage,
 } from '@/lib/settings';
 import {
@@ -328,6 +328,7 @@ export default defineContentScript({
     let activeCrawlRequestId = '';
     let loadAllForVideoId: string | null = null;
     let loadAllStartedAt = 0;
+    let lastCrawlProgressAt = 0;
     let hiddenAt = 0;
     let lastCountRequestAt = 0;
     let lastCountRequestVideoId = '';
@@ -339,7 +340,8 @@ export default defineContentScript({
     // The order the popup is showing. YouTube resets to "Top" on every video,
     // so this does too.
     let sortOrder: CommentSortOrder = DEFAULT_COMMENT_SORT_ORDER;
-    let hideFilteredComments = false;
+    // Default matches the watch page (extras hidden). Show spam turns this off.
+    let hideFilteredComments = true;
     // True once YouTube's own ranking is in the store. Page order is only a
     // stand-in until then, and mixing the two scales would scramble the list.
     let hasFetchedRanks = false;
@@ -1041,6 +1043,7 @@ export default defineContentScript({
 
       loadAllForVideoId = videoId;
       loadAllStartedAt = Date.now();
+      lastCrawlProgressAt = Date.now();
       const flight = (async () => {
         const ready = await waitForRenderedVideo(videoId);
         if (!ready || generation !== loadGeneration || activeVideoId !== videoId) {
@@ -1093,6 +1096,7 @@ export default defineContentScript({
             }
 
             if (data.type === INNERTUBE_BRIDGE.progress) {
+              lastCrawlProgressAt = Date.now();
               status = 'loading-all';
               loadAllCount = data.count;
               applyListedCommentCount(data.totalCommentsLabel);
@@ -1189,6 +1193,7 @@ export default defineContentScript({
           loadAllInFlight = null;
           loadAllForVideoId = null;
           loadAllStartedAt = 0;
+          lastCrawlProgressAt = 0;
         }
       });
 
@@ -1519,6 +1524,7 @@ export default defineContentScript({
           batch.requestId === activeCrawlRequestId &&
           batch.videoId === activeVideoId
         ) {
+          lastCrawlProgressAt = Date.now();
           status = 'loading-all';
           loadAllCount = typeof batch.count === 'number' ? batch.count : comments.size;
           applyListedCommentCount(batch.totalCommentsLabel);
@@ -1641,8 +1647,8 @@ export default defineContentScript({
     ) => {
       if (areaName !== 'local') return;
 
-      if (HIDE_FILTERED_KEY in changes) {
-        hideFilteredComments = changes[HIDE_FILTERED_KEY]?.newValue === true;
+      if (SHOW_SPAM_KEY in changes) {
+        hideFilteredComments = changes[SHOW_SPAM_KEY]?.newValue !== true;
         publishUpdate();
       }
 
@@ -1671,20 +1677,33 @@ export default defineContentScript({
 
     // Chrome freezes inactive tabs and aborts their network calls. The
     // in-flight comment request then never settles, so coming back does
-    // nothing until the page is reloaded.
+    // nothing until the page is reloaded. A full crawl of a few thousand
+    // comments takes minutes, so "hung" means no progress for a while, not
+    // that the load has simply run longer than 45 seconds.
     const HIDDEN_REFETCH_MS = 20_000;
+    const NO_PROGRESS_MS = 90_000;
 
     const dropHungLoad = (force: boolean) => {
       if (!loadAllInFlight) return false;
       const hiddenLong = hiddenAt > 0 && Date.now() - hiddenAt >= HIDDEN_REFETCH_MS;
       const hung =
-        loadAllStartedAt > 0 && Date.now() - loadAllStartedAt > 45_000;
+        lastCrawlProgressAt > 0 && Date.now() - lastCrawlProgressAt > NO_PROGRESS_MS;
       if (!force && !hiddenLong && !hung) return false;
 
+      if (activeCrawlRequestId) {
+        void browser.runtime
+          .sendMessage({
+            type: CRAWL_MESSAGES.cancel,
+            requestId: activeCrawlRequestId,
+          })
+          .catch(() => undefined);
+        activeCrawlRequestId = '';
+      }
       loadGeneration += 1;
       loadAllInFlight = null;
       loadAllForVideoId = null;
       loadAllStartedAt = 0;
+      lastCrawlProgressAt = 0;
       if (status === 'loading-all') {
         loadAllCount = null;
         status = comments.size > 0 ? 'ready' : 'waiting-for-comments';
@@ -1758,8 +1777,9 @@ export default defineContentScript({
       autoEnabled = enabled;
       scheduleAutoSummarize();
     });
-    void getHideFilteredComments().then((enabled) => {
-      hideFilteredComments = enabled;
+    void getShowSpamComments().then((showSpam) => {
+      hideFilteredComments = !showSpam;
+      publishUpdate();
     });
   },
 });
