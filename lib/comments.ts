@@ -59,6 +59,7 @@ export const COMMENT_MESSAGES = {
   chatAboutComments: 'youtube-comments:chat',
   wake: 'youtube-comments:wake',
   searchComments: 'youtube-comments:search',
+  getReplyDiagnostics: 'youtube-comments:reply-diagnostics',
 } as const;
 
 export type AutoSummarizePhase = 'off' | 'idle' | 'fetching' | 'summarizing';
@@ -104,13 +105,13 @@ export interface YouTubeComment {
   // display order with a depth on each entry, so the nesting is rebuilt from
   // the two together. A top-level comment is 0.
   replyLevel?: number;
-  // True when the comment came back through YouTube's "Top" listing, which is
-  // its moderated set. Replies reached through "Newest" only are the ones
-  // YouTube describes as "including potential spam" - banned and held-for-
-  // review comments arrive on that path and on no other.
+  // True when the comment came back through YouTube's "Top" listing. Inside
+  // a thread Top serves fewer replies than Newest, and the reply button
+  // counts only Top's set. Held-for-review and removed comments are served
+  // by neither listing.
   featured?: boolean;
-  // The reply count YouTube reports in its Top listing, which excludes banned
-  // and held replies. Only set on top-level comments the Top listing served.
+  // The reply count YouTube reports in its Top listing. Only set on
+  // top-level comments the Top listing served.
   featuredReplyCount?: string | null;
 }
 
@@ -185,6 +186,10 @@ export type CollectorRequest =
       question: string;
       history: Array<{ role: 'user' | 'assistant'; text: string }>;
       language?: string;
+    }
+  | {
+      type: typeof COMMENT_MESSAGES.getReplyDiagnostics;
+      limit?: number;
     };
 
 export interface CommentsPageResponse {
@@ -337,10 +342,11 @@ export function pageReplyCount(value: string | null | undefined): number | null 
   return amount * scale;
 }
 
-// Hide spam keeps the replies behind YouTube's reply button. That button is
-// the size of the set, and the replies are the ones Top rendered. Replies only
-// Newest returned are the ones the page hides, so they are not used to pad a
-// short Top listing up to the button.
+// Show spam off matches YouTube's reply button. Prefer replies Top actually
+// served, but the Top reply chain is paginated and can stop short of the
+// button total in the browser. When that happens, pad from the other loaded
+// replies up to the button count rather than leaving the thread under-count.
+// Anything beyond the button stays hidden as extras.
 export function selectShownReplies(
   replies: YouTubeComment[],
   pageCount: number | null,
@@ -348,24 +354,27 @@ export function selectShownReplies(
   if (replies.length === 0) return replies;
   const target = pageCount != null && pageCount > 0 ? pageCount : null;
   const featured = replies.filter((reply) => reply.featured === true);
-  // Nothing was marked from Top, so there is no way to tell the page's
-  // replies from the ones it hides.
+  // Nothing was marked from Top, so there is no moderated subset to match.
   if (featured.length === 0) return replies;
-  if (target == null || target >= featured.length) {
-    if (featured.length === replies.length) return replies;
-    const ids = new Set(featured.map((reply) => reply.id));
-    return replies.filter((reply) => ids.has(reply.id));
-  }
+  if (featured.length === replies.length) return replies;
 
   const byRank = (left: YouTubeComment, right: YouTubeComment) => {
     const leftRank = typeof left.replyRank === 'number' ? left.replyRank : Number.MAX_SAFE_INTEGER;
     const rightRank = typeof right.replyRank === 'number' ? right.replyRank : Number.MAX_SAFE_INTEGER;
-    return leftRank - rightRank;
+    if (leftRank !== rightRank) return leftRank - rightRank;
+    // Stable fallback: keep store order when ranks are missing.
+    return 0;
   };
-  const ordered = featured.slice().sort(byRank);
+
+  // No button total: keep every Top-served reply, hide the rest.
+  if (target == null) {
+    const ids = new Set(featured.map((reply) => reply.id));
+    return replies.filter((reply) => ids.has(reply.id));
+  }
+
   const byId = new Map(replies.map((reply) => [reply.id, reply]));
   const chosen = new Set<string>();
-  const consider = (reply: YouTubeComment) => {
+  const considerFeatured = (reply: YouTubeComment) => {
     if (chosen.size >= target || chosen.has(reply.id) || reply.featured !== true) return;
     const chain: YouTubeComment[] = [];
     let current: YouTubeComment | undefined = reply;
@@ -380,15 +389,27 @@ export function selectShownReplies(
     for (const item of chain) chosen.add(item.id);
   };
 
-  for (const reply of ordered) consider(reply);
+  const orderedFeatured = featured.slice().sort(byRank);
+  for (const reply of orderedFeatured) considerFeatured(reply);
   if (chosen.size < target) {
-    for (const reply of ordered) {
+    for (const reply of orderedFeatured) {
       if (chosen.size >= target) break;
       chosen.add(reply.id);
     }
   }
 
-  if (chosen.size === 0) return replies.filter((reply) => reply.featured === true);
+  // Top came up short of the button. Fill from the remaining loaded replies
+  // (Newest extras) so OFF tracks the page number instead of the incomplete
+  // Top membership set.
+  if (chosen.size < target) {
+    for (const reply of replies) {
+      if (chosen.size >= target) break;
+      chosen.add(reply.id);
+    }
+  }
+
+  if (chosen.size === 0) return featured;
+  // Preserve the store's reply order; only membership changes.
   return replies.filter((reply) => chosen.has(reply.id));
 }
 

@@ -1,4 +1,4 @@
-import { CommentOrder } from '@/lib/comment-index';
+import { CommentStore, type CommentView } from '@/lib/comment-store';
 import {
   COMMENT_MESSAGES,
   CRAWL_MESSAGES,
@@ -23,11 +23,8 @@ import {
   canonicalYouTubeCommentId,
   flattenCommentThreads,
   getYouTubeVideoId,
-  isFeaturedByYouTube,
-  makeCommentThread,
   pageReplyCount,
   replyButtonCountFromText,
-  selectShownReplies,
   threadParentId,
   toCommentSortOrder,
 } from '@/lib/comments';
@@ -47,9 +44,11 @@ import {
 import { isReplyLanguageCode } from '@/lib/languages';
 import {
   AUTO_SUMMARIZE_KEY,
-  HIDE_FILTERED_KEY,
+  DEBUG_REPLIES_KEY,
+  SHOW_SPAM_KEY,
   getAutoSummarizeEnabled,
-  getHideFilteredComments,
+  getDebugRepliesEnabled,
+  getShowSpamComments,
   getReplyLanguage,
 } from '@/lib/settings';
 import {
@@ -331,6 +330,7 @@ export default defineContentScript({
     let activeCrawlRequestId = '';
     let loadAllForVideoId: string | null = null;
     let loadAllStartedAt = 0;
+    let lastCrawlProgressAt = 0;
     let hiddenAt = 0;
     let lastCountRequestAt = 0;
     let lastCountRequestVideoId = '';
@@ -342,7 +342,9 @@ export default defineContentScript({
     // The order the popup is showing. YouTube resets to "Top" on every video,
     // so this does too.
     let sortOrder: CommentSortOrder = DEFAULT_COMMENT_SORT_ORDER;
-    let hideFilteredComments = false;
+    // Default matches the watch page (extras hidden). Show spam turns this off.
+    let hideFilteredComments = true;
+    let debugReplies = false;
     // True once YouTube's own ranking is in the store. Page order is only a
     // stand-in until then, and mixing the two scales would scramble the list.
     let hasFetchedRanks = false;
@@ -350,13 +352,8 @@ export default defineContentScript({
     let searchIndex: { key: string; entries: Array<{ id: string; hay: string }> } | null = null;
     let searchMatches: { key: string; ids: string[] } | null = null;
 
-    const comments = new Map<string, YouTubeComment>();
-    // Reply totals read off the watch page. The crawl must not replace them
-    // with the toolbar total, which counts a different set of replies.
-    const pageReplyCounts = new Set<string>();
-    const order = new CommentOrder();
-    let rootCache: { key: string; ids: string[] } | null = null;
-    let filterCache: { key: string; count: number } | null = null;
+    const store = new CommentStore();
+    const comments = store.comments;
     let fallbackIds = new WeakMap<Element, string>();
     let scheduleAutoSummarize = () => {};
 
@@ -462,52 +459,7 @@ export default defineContentScript({
     };
 
     const remember = (comment: YouTubeComment, fromPage = false) => {
-      const previous = comments.get(comment.id);
-      if (!previous) {
-        comments.set(comment.id, comment);
-      } else {
-        // The watch-page button is the total Hide spam must match. A later
-        // crawl payload must not wipe it, and a toolbar-sized total must not
-        // replace a smaller button once the page has been read.
-        // A page total locks out a later toolbar-sized count. A lock with no
-        // number yet must not freeze the thread at "unknown" and hide the
-        // real button total when it arrives.
-        const locked =
-          pageReplyCounts.has(previous.id) &&
-          !fromPage &&
-          pageReplyCount(previous.featuredReplyCount) != null;
-        const prevTotal = pageReplyCount(previous.featuredReplyCount);
-        const nextTotal = pageReplyCount(comment.featuredReplyCount);
-        let featuredReplyCount = previous.featuredReplyCount ?? null;
-        if (fromPage) {
-          featuredReplyCount = comment.featuredReplyCount ?? previous.featuredReplyCount ?? null;
-        } else if (!locked && (prevTotal == null || (nextTotal != null && nextTotal > prevTotal))) {
-          featuredReplyCount = comment.featuredReplyCount ?? previous.featuredReplyCount ?? null;
-        }
-        comments.set(comment.id, {
-          ...previous,
-          ...comment,
-          parentId: comment.parentId || previous.parentId,
-          isReply: previous.isReply || comment.isReply,
-          featured: Boolean(previous.featured || comment.featured),
-          featuredReplyCount,
-          topRank: comment.topRank ?? previous.topRank,
-          newestRank: comment.newestRank ?? previous.newestRank,
-          replyRank: comment.replyRank ?? previous.replyRank,
-          replyToId: comment.replyToId || previous.replyToId,
-          likeCount: comment.likeCount ?? previous.likeCount,
-          replyCount: comment.replyCount ?? previous.replyCount,
-          isPinned: previous.isPinned || comment.isPinned,
-          pinnedLabel: comment.pinnedLabel || previous.pinnedLabel,
-          isCreatorHearted: previous.isCreatorHearted || comment.isCreatorHearted,
-          isVerified: previous.isVerified || comment.isVerified,
-          isChannelOwner: previous.isChannelOwner || comment.isChannelOwner,
-        });
-      }
-      const stored = comments.get(comment.id);
-      if (stored) order.note(stored);
-      rootCache = null;
-      filterCache = null;
+      store.remember(comment, fromPage);
     };
 
     // Copies the reply totals currently drawn under each visible thread.
@@ -520,18 +472,9 @@ export default defineContentScript({
       let changed = false;
       for (const thread of root.querySelectorAll('ytd-comment-thread-renderer')) {
         const count = visibleReplyCount(thread);
-        let id = commentIdFromThread(thread);
+        const id = commentIdFromThread(thread);
         if (!count || !id) continue;
-        let existing = comments.get(id);
-        if (existing?.isReply) {
-          const rootId = threadParentId(existing);
-          id = rootId;
-          existing = rootId ? comments.get(rootId) : undefined;
-        }
-        if (!existing || existing.isReply || !id) continue;
-        pageReplyCounts.add(existing.id);
-        if (pageReplyCount(existing.featuredReplyCount) === pageReplyCount(count)) continue;
-        remember({ ...existing, featuredReplyCount: count }, true);
+        if (!store.notePageReplyCount(id, count)) continue;
         replyStamp += 1;
         changed = true;
       }
@@ -539,100 +482,26 @@ export default defineContentScript({
     };
 
     const applyPatch = (patch: CommentPatch) => {
-      const existing = comments.get(patch.id);
-      if (!existing) return;
-      remember({
-        ...existing,
-        topRank: 'topRank' in patch ? patch.topRank : existing.topRank,
-        newestRank: 'newestRank' in patch ? patch.newestRank : existing.newestRank,
-        replyRank: 'replyRank' in patch ? patch.replyRank : existing.replyRank,
-        featured: 'featured' in patch ? patch.featured : existing.featured,
-        replyToId: 'replyToId' in patch ? patch.replyToId : existing.replyToId,
-        isPinned: 'isPinned' in patch ? Boolean(patch.isPinned) : existing.isPinned,
-        pinnedLabel: 'pinnedLabel' in patch ? patch.pinnedLabel : existing.pinnedLabel,
-        likeCount: 'likeCount' in patch ? patch.likeCount ?? null : existing.likeCount,
-        // Toolbar replyCount includes replies the watch-page button leaves out.
-        // The button total stays in featuredReplyCount and must not be replaced
-        // once the page has shown it.
-        replyCount:
-          'replyCount' in patch ? patch.replyCount ?? null : existing.replyCount,
-        featuredReplyCount:
-          pageReplyCounts.has(existing.id) &&
-          pageReplyCount(existing.featuredReplyCount) != null
-            ? existing.featuredReplyCount
-            : 'featuredReplyCount' in patch
-              ? patch.featuredReplyCount ?? existing.featuredReplyCount
-              : existing.featuredReplyCount,
-      });
+      store.applyPatch(patch);
     };
 
-    const isIndexedRoot = (id: string) => {
-      const comment = comments.get(id);
-      return Boolean(comment && !comment.isReply);
-    };
+    const currentView = (): CommentView => ({
+      sortOrder,
+      hideFiltered: hideFilteredComments,
+      canFilter: fetchedAll && !truncated,
+    });
 
-    // A comment counts as unfeatured only once the whole thread has been
-    // walked. On a partial load a missing Top listing just means the Top pass
-    // has not reached it yet, so filtering is held back until then.
-    const canFilterByRanking = () => fetchedAll && !truncated;
+    const threadFor = (id: string): CommentThread | null => store.thread(id, currentView());
 
-    // Hide spam keeps the replies behind YouTube's reply button. The rest are
-    // what Newest adds, and they stay in the thread until spam is hidden.
-    const withFeaturedReplies = (thread: CommentThread): CommentThread => {
-      const kept = selectShownReplies(
-        thread.replies,
-        pageReplyCount(thread.parent.featuredReplyCount),
-      );
-      if (kept === thread.replies) return thread;
-      return makeCommentThread(thread.parent, kept);
-    };
-
-    const orderedRootIds = () => {
-      const key = [
-        sortOrder,
-        hideFilteredComments,
-        comments.size,
-        capturedAt,
-        fetchedAll,
-        truncated,
-      ].join('|');
-      if (rootCache?.key === key) return rootCache.ids;
-      const ids = order.rootIds(sortOrder, isIndexedRoot).filter((id) => {
-        if (!hideFilteredComments || !canFilterByRanking()) return true;
-        const comment = comments.get(id);
-        return Boolean(comment && isFeaturedByYouTube(comment));
-      });
-      rootCache = { key, ids };
-      return ids;
-    };
-
-    const threadFor = (id: string): CommentThread | null => {
-      const parent = comments.get(id);
-      if (!parent || parent.isReply) return null;
-      const thread = makeCommentThread(parent, order.replies(parent.id, comments));
-      if (hideFilteredComments && canFilterByRanking()) return withFeaturedReplies(thread);
-      return thread;
-    };
-
-    const threadsFrom = (offset: number, limit: number): CommentThread[] => {
-      const end = offset + limit;
-      const ids =
-        hideFilteredComments && canFilterByRanking()
-          ? orderedRootIds().slice(offset, end)
-          : order.rootIds(sortOrder, isIndexedRoot, end).slice(offset);
-      const threads: CommentThread[] = [];
-      for (const id of ids) {
-        const thread = threadFor(id);
-        if (thread) threads.push(thread);
-      }
-      return threads;
-    };
+    const threadsFrom = (offset: number, limit: number): CommentThread[] =>
+      store.threads(offset, limit, currentView());
 
     const collectListedComments = async (): Promise<YouTubeComment[]> => {
-      const ids = orderedRootIds();
+      const view = currentView();
+      const ids = store.rootIds(view);
       const listed: YouTubeComment[] = [];
       for (let index = 0; index < ids.length; index += 1) {
-        const thread = threadFor(ids[index] ?? '');
+        const thread = store.thread(ids[index] ?? '', view);
         if (!thread) continue;
         listed.push(thread.parent, ...thread.replies);
         if (index > 0 && index % 300 === 0) await yieldToUi();
@@ -640,24 +509,44 @@ export default defineContentScript({
       return listed;
     };
 
-    const filteredThreadCount = () => {
-      if (!canFilterByRanking()) return 0;
-      const key = `${comments.size}|${capturedAt}|${sortOrder}`;
-      if (filterCache?.key === key) return filterCache.count;
-      let hidden = 0;
-      for (const id of order.rootIds(sortOrder, isIndexedRoot)) {
-        const parent = comments.get(id);
-        if (!parent) continue;
-        const replies = order.replies(id, comments);
-        if (!isFeaturedByYouTube(parent)) {
-          hidden += 1 + replies.length;
-          continue;
+    const buildReplyDiagnostics = (limit = 12) => {
+      const view = currentView();
+      return {
+        videoId: activeVideoId,
+        fetchedAll,
+        truncated,
+        capturedCount: comments.size,
+        totalCommentsLabel,
+        showSpam: !hideFilteredComments,
+        canFilter: view.canFilter,
+        extrasHidden: store.hiddenCount({ ...view, hideFiltered: true }),
+        threads: store.replyDiagnostics(limit),
+      };
+    };
+
+    const publishDiagnostics = (report: ReturnType<typeof buildReplyDiagnostics>) => {
+      try {
+        (window as Window & { __commentCatcherDiagnostics?: unknown }).__commentCatcherDiagnostics =
+          report;
+        // Also mirror into the DOM so Playwright / page.evaluate can read it
+        // from the page world (content-script window bindings stay isolated).
+        let node = document.getElementById(
+          'comment-catcher-diagnostics',
+        ) as HTMLScriptElement | null;
+        if (!node) {
+          node = document.createElement('script');
+          node.id = 'comment-catcher-diagnostics';
+          node.type = 'application/json';
+          node.setAttribute('data-comment-catcher', 'diagnostics');
+          document.documentElement.appendChild(node);
         }
-        const kept = withFeaturedReplies(makeCommentThread(parent, replies));
-        hidden += replies.length - kept.replies.length;
+        node.textContent = JSON.stringify(report);
+        if (debugReplies) {
+          console.info('[Comment Catcher] reply diagnostics', report);
+        }
+      } catch {
+        // Page may deny the assignment; the message response still returns it.
       }
-      filterCache = { key, count: hidden };
-      return hidden;
     };
 
     const getSnapshot = (): CommentsSnapshot => {
@@ -671,10 +560,7 @@ export default defineContentScript({
         status,
         comments: flattenCommentThreads(threads),
         capturedCount: comments.size,
-        threadCount:
-          hideFilteredComments && canFilterByRanking()
-            ? orderedRootIds().length
-            : order.countRoots(),
+        threadCount: store.countRoots(),
         capturedAt,
         fetchedAll,
         truncated,
@@ -683,7 +569,7 @@ export default defineContentScript({
         autoError,
         sortOrder,
         hideFilteredComments,
-        filteredCount: filteredThreadCount(),
+        filteredCount: store.hiddenCount(currentView()),
       };
     };
 
@@ -762,11 +648,7 @@ export default defineContentScript({
           .catch(() => undefined);
         activeCrawlRequestId = '';
       }
-      comments.clear();
-      pageReplyCounts.clear();
-      order.reset();
-      rootCache = null;
-      filterCache = null;
+      store.clear();
       replyStamp = 0;
       fallbackId = 0;
       fallbackIds = new WeakMap<Element, string>();
@@ -1121,11 +1003,7 @@ export default defineContentScript({
       const requestId = crypto.randomUUID();
       activeCrawlRequestId = requestId;
       status = 'loading-all';
-      comments.clear();
-      pageReplyCounts.clear();
-      order.reset();
-      rootCache = null;
-      filterCache = null;
+      store.clear();
       hasFetchedRanks = false;
       fetchedAll = false;
       truncated = false;
@@ -1167,6 +1045,7 @@ export default defineContentScript({
         capturedAt = comments.size > 0 ? new Date().toISOString() : capturedAt;
         status = comments.size > 0 ? 'ready' : 'no-comments';
         publishUpdateNow();
+        publishDiagnostics(buildReplyDiagnostics());
         return {
           ok: comments.size > 0 || Boolean(result?.ok),
           count: comments.size,
@@ -1208,6 +1087,7 @@ export default defineContentScript({
 
       loadAllForVideoId = videoId;
       loadAllStartedAt = Date.now();
+      lastCrawlProgressAt = Date.now();
       const flight = (async () => {
         const ready = await waitForRenderedVideo(videoId);
         if (!ready || generation !== loadGeneration || activeVideoId !== videoId) {
@@ -1260,6 +1140,7 @@ export default defineContentScript({
             }
 
             if (data.type === INNERTUBE_BRIDGE.progress) {
+              lastCrawlProgressAt = Date.now();
               status = 'loading-all';
               loadAllCount = data.count;
               applyListedCommentCount(data.totalCommentsLabel);
@@ -1289,11 +1170,7 @@ export default defineContentScript({
             }
 
             if (data.comments.length > 0) {
-              comments.clear();
-              pageReplyCounts.clear();
-              order.reset();
-              rootCache = null;
-              filterCache = null;
+              store.clear();
               for (const comment of data.comments) remember(comment);
             }
             hasFetchedRanks = true;
@@ -1306,6 +1183,7 @@ export default defineContentScript({
             applyListedCommentCount(data.totalCommentsLabel);
             status = comments.size > 0 ? 'ready' : 'no-comments';
             publishUpdate();
+            publishDiagnostics(buildReplyDiagnostics());
             finish({
               ok: true,
               count: comments.size,
@@ -1342,11 +1220,7 @@ export default defineContentScript({
 
           window.addEventListener('message', onPageMessage);
           status = 'loading-all';
-          comments.clear();
-          pageReplyCounts.clear();
-          order.reset();
-          rootCache = null;
-          filterCache = null;
+          store.clear();
           loadAllCount = 0;
           fetchedAll = false;
           capturedAt = null;
@@ -1364,6 +1238,7 @@ export default defineContentScript({
           loadAllInFlight = null;
           loadAllForVideoId = null;
           loadAllStartedAt = 0;
+          lastCrawlProgressAt = 0;
         }
       });
 
@@ -1694,6 +1569,7 @@ export default defineContentScript({
           batch.requestId === activeCrawlRequestId &&
           batch.videoId === activeVideoId
         ) {
+          lastCrawlProgressAt = Date.now();
           status = 'loading-all';
           loadAllCount = typeof batch.count === 'number' ? batch.count : comments.size;
           applyListedCommentCount(batch.totalCommentsLabel);
@@ -1735,7 +1611,7 @@ export default defineContentScript({
           videoId: activeVideoId,
           offset,
           comments: flattenCommentThreads(threads),
-          total: orderedRootIds().length,
+          total: store.countRoots(),
           sortOrder,
           hideFilteredComments,
         };
@@ -1805,6 +1681,17 @@ export default defineContentScript({
         );
       }
 
+      if (request.type === COMMENT_MESSAGES.getReplyDiagnostics) {
+        if (window !== window.top) return undefined;
+        const limit = Math.min(
+          40,
+          Math.max(1, Math.floor(request.limit ?? 12) || 12),
+        );
+        const report = buildReplyDiagnostics(limit);
+        publishDiagnostics(report);
+        return Promise.resolve(report);
+      }
+
       return undefined;
     };
 
@@ -1816,9 +1703,13 @@ export default defineContentScript({
     ) => {
       if (areaName !== 'local') return;
 
-      if (HIDE_FILTERED_KEY in changes) {
-        hideFilteredComments = changes[HIDE_FILTERED_KEY]?.newValue === true;
+      if (SHOW_SPAM_KEY in changes) {
+        hideFilteredComments = changes[SHOW_SPAM_KEY]?.newValue !== true;
         publishUpdate();
+      }
+      if (DEBUG_REPLIES_KEY in changes) {
+        debugReplies = changes[DEBUG_REPLIES_KEY]?.newValue === true;
+        if (debugReplies) publishDiagnostics(buildReplyDiagnostics());
       }
 
       if (!(AUTO_SUMMARIZE_KEY in changes)) return;
@@ -1846,20 +1737,33 @@ export default defineContentScript({
 
     // Chrome freezes inactive tabs and aborts their network calls. The
     // in-flight comment request then never settles, so coming back does
-    // nothing until the page is reloaded.
+    // nothing until the page is reloaded. A full crawl of a few thousand
+    // comments takes minutes, so "hung" means no progress for a while, not
+    // that the load has simply run longer than 45 seconds.
     const HIDDEN_REFETCH_MS = 20_000;
+    const NO_PROGRESS_MS = 90_000;
 
     const dropHungLoad = (force: boolean) => {
       if (!loadAllInFlight) return false;
       const hiddenLong = hiddenAt > 0 && Date.now() - hiddenAt >= HIDDEN_REFETCH_MS;
       const hung =
-        loadAllStartedAt > 0 && Date.now() - loadAllStartedAt > 45_000;
+        lastCrawlProgressAt > 0 && Date.now() - lastCrawlProgressAt > NO_PROGRESS_MS;
       if (!force && !hiddenLong && !hung) return false;
 
+      if (activeCrawlRequestId) {
+        void browser.runtime
+          .sendMessage({
+            type: CRAWL_MESSAGES.cancel,
+            requestId: activeCrawlRequestId,
+          })
+          .catch(() => undefined);
+        activeCrawlRequestId = '';
+      }
       loadGeneration += 1;
       loadAllInFlight = null;
       loadAllForVideoId = null;
       loadAllStartedAt = 0;
+      lastCrawlProgressAt = 0;
       if (status === 'loading-all') {
         loadAllCount = null;
         status = comments.size > 0 ? 'ready' : 'waiting-for-comments';
@@ -1933,8 +1837,18 @@ export default defineContentScript({
       autoEnabled = enabled;
       scheduleAutoSummarize();
     });
-    void getHideFilteredComments().then((enabled) => {
-      hideFilteredComments = enabled;
+    void getShowSpamComments().then((showSpam) => {
+      hideFilteredComments = !showSpam;
+      publishUpdate();
+    });
+    void getDebugRepliesEnabled().then((enabled) => {
+      debugReplies = enabled;
+      if (debugReplies) publishDiagnostics(buildReplyDiagnostics());
+    });
+
+    // Playwright / page scripts can request a fresh dump without the popup.
+    ctx.addEventListener(window, 'comment-catcher:request-diagnostics', () => {
+      publishDiagnostics(buildReplyDiagnostics());
     });
   },
 });

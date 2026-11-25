@@ -287,12 +287,29 @@ function geminiErrorResponse(
     );
   }
 
+  if (error instanceof Error && error.message === 'GEMINI_EMPTY_RESPONSE') {
+    return context.json(
+      {
+        error:
+          kind === 'chat'
+            ? 'The AI service returned an empty answer. Please try again.'
+            : 'The AI service returned an empty summary. Please try again.',
+      },
+      502,
+    );
+  }
+
   console.error(kind === 'chat' ? 'Chat request failed' : 'Summary request failed', error);
   const fallback =
     kind === 'chat'
       ? 'The AI service could not answer that question.'
       : 'The AI service could not create a summary.';
-  const detail = error instanceof GeminiRequestError ? error.detail : '';
+  const detail =
+    error instanceof GeminiRequestError
+      ? error.detail
+      : error instanceof Error && error.message && !error.message.startsWith('GEMINI_')
+        ? error.message
+        : '';
   return context.json(
     { error: detail ? `${fallback} ${detail}` : fallback },
     502,

@@ -217,7 +217,14 @@ export async function runCommentCrawl(options: {
           comments: added && added.length > 0 ? added : undefined,
           patches: patches && patches.length > 0 ? patches : undefined,
         };
-        await browser.tabs.sendMessage(options.tabId, message, { frameId: 0 });
+        // A brief tab hiccup must not abort the crawl. Dropping the batch
+        // loses progress for that page only; throwing here used to stop the
+        // whole load around 4,200 comments while YouTube still had more.
+        try {
+          await browser.tabs.sendMessage(options.tabId, message, { frameId: 0 });
+        } catch {
+          // The content script may reconnect on the next batch.
+        }
       },
       undefined,
       options.videoId,

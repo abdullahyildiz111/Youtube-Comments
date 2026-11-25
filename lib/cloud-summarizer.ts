@@ -6,10 +6,11 @@ const MAX_REQUEST_TIMEOUT_MS = 1_200_000;
 
 function modelTimeoutMs(commentCount: number): number {
   // A long thread is summarized in many Gemini calls, and a busy free tier
-  // waits out its per-minute quota instead of failing the whole summary.
+  // waits out its per-minute quota between chunks instead of failing the
+  // whole summary. A few thousand comments can need several minute-long waits.
   return Math.min(
     MAX_REQUEST_TIMEOUT_MS,
-    Math.max(REQUEST_TIMEOUT_MS, 180_000 + commentCount * 80),
+    Math.max(REQUEST_TIMEOUT_MS, 300_000 + commentCount * 120),
   );
 }
 

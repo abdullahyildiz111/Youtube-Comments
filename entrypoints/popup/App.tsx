@@ -33,10 +33,12 @@ import { languageLabel, REPLY_LANGUAGES } from '@/lib/languages';
 import {
   AUTO_SUMMARIZE_KEY,
   DEFAULT_REPLY_LANGUAGE,
-  HIDE_FILTERED_KEY,
+  DEBUG_REPLIES_KEY,
+  SHOW_SPAM_KEY,
   getReplyLanguage,
   setAutoSummarizeEnabled,
-  setHideFilteredComments,
+  setDebugRepliesEnabled,
+  setShowSpamComments,
   setReplyLanguage as storeReplyLanguage,
 } from '@/lib/settings';
 import {
@@ -574,14 +576,19 @@ function CommentsPane({
   pageComments,
   visibleCount,
   sortOrder,
-  hideFiltered,
+  showSpam,
   threadError,
   isLoadingAll,
   isBusy,
   filterUnavailable,
   exportKind,
   onSortChange,
-  onToggleHideSpam,
+  onToggleShowSpam,
+  debugReplies,
+  diagnosticsText,
+  onToggleDebugReplies,
+  onRefreshDiagnostics,
+  onCopyDiagnostics,
   onExport,
   onLoadAll,
   onLoadMore,
@@ -592,14 +599,19 @@ function CommentsPane({
   pageComments: YouTubeComment[];
   visibleCount: number;
   sortOrder: CommentSortOrder;
-  hideFiltered: boolean;
+  showSpam: boolean;
   threadError: string | null;
   isLoadingAll: boolean;
   isBusy: boolean;
   filterUnavailable: boolean;
   exportKind: 'csv' | 'pdf' | null;
   onSortChange: (next: CommentSortOrder) => void;
-  onToggleHideSpam: () => void;
+  onToggleShowSpam: () => void;
+  debugReplies: boolean;
+  diagnosticsText: string;
+  onToggleDebugReplies: () => void;
+  onRefreshDiagnostics: () => void;
+  onCopyDiagnostics: () => void;
   onExport: (kind: 'csv' | 'pdf') => void;
   onLoadAll: () => void;
   onLoadMore: () => void;
@@ -620,10 +632,10 @@ function CommentsPane({
   const loadingMoreRef = useRef(false);
   const tabIdRef = useRef(tabId);
   const sortOrderRef = useRef(sortOrder);
-  const hideFilteredRef = useRef(hideFiltered);
+  const showSpamRef = useRef(showSpam);
   tabIdRef.current = tabId;
   sortOrderRef.current = sortOrder;
-  hideFilteredRef.current = hideFiltered;
+  showSpamRef.current = showSpam;
 
   const queryRef = useRef('');
   const seenVideo = useRef(snapshot.videoId);
@@ -655,7 +667,7 @@ function CommentsPane({
           offset,
           limit: 80,
           sortOrder: sortOrderRef.current,
-          hideFilteredComments: hideFilteredRef.current,
+          hideFilteredComments: !showSpamRef.current,
         },
         { frameId: 0 },
       )) as SearchCommentsResponse;
@@ -718,7 +730,7 @@ function CommentsPane({
   useEffect(() => {
     if (!queryRef.current) return;
     void requestSearch(queryRef.current, 0, false);
-  }, [hideFiltered, sortOrder, commentRevision, requestSearch]);
+  }, [showSpam, sortOrder, commentRevision, requestSearch]);
 
   const canLoadMore = searchQuery ? searchOffset < searchTotal : pageCanLoadMore;
 
@@ -865,19 +877,19 @@ function CommentsPane({
           <div className="filter-control">
             <label
               className={`auto-switch filter-switch${filterUnavailable ? ' is-unavailable' : ''}`}
-              title={filterUnavailable ? copy.hideSpamUnavailable : copy.hideSpamTitle}
+              title={filterUnavailable ? copy.showSpamUnavailable : copy.showSpamTitle}
             >
-              <span>{copy.hideSpam}</span>
+              <span>{copy.showSpam}</span>
               <input
                 type="checkbox"
-                checked={hideFiltered}
+                checked={showSpam}
                 disabled={filterUnavailable}
-                onChange={onToggleHideSpam}
+                onChange={onToggleShowSpam}
               />
               <span className="switch-track" />
             </label>
             <p className="filter-count">
-              {hideFiltered &&
+              {!showSpam &&
               !filterUnavailable &&
               snapshot.fetchedAll &&
               snapshot.filteredCount > 0
@@ -886,6 +898,31 @@ function CommentsPane({
                   })
                 : ''}
             </p>
+            <label
+              className="auto-switch filter-switch debug-switch"
+              title="Log per-thread Top/Newest/kept/hidden reply counts to the console and show a copyable report."
+            >
+              <span>Debug replies</span>
+              <input
+                type="checkbox"
+                checked={debugReplies}
+                onChange={onToggleDebugReplies}
+              />
+              <span className="switch-track" />
+            </label>
+            {debugReplies && (
+              <div className="debug-replies">
+                <div className="debug-replies-actions">
+                  <button type="button" className="toolbar-button" onClick={onRefreshDiagnostics}>
+                    Refresh
+                  </button>
+                  <button type="button" className="toolbar-button" onClick={onCopyDiagnostics}>
+                    Copy
+                  </button>
+                </div>
+                <pre className="debug-replies-report">{diagnosticsText || 'Loading…'}</pre>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -981,9 +1018,11 @@ function App() {
   );
   const sortOrderRef = useRef(sortOrder);
   sortOrderRef.current = sortOrder;
-  const [hideFiltered, setHideFiltered] = useState(false);
-  const hideFilteredRef = useRef(hideFiltered);
-  hideFilteredRef.current = hideFiltered;
+  const [showSpam, setShowSpam] = useState(false);
+  const showSpamRef = useRef(showSpam);
+  showSpamRef.current = showSpam;
+  const [debugReplies, setDebugReplies] = useState(false);
+  const [diagnosticsText, setDiagnosticsText] = useState('');
   const settingsReady = useRef(false);
   const [replyLanguage, setReplyLanguage] = useState(DEFAULT_REPLY_LANGUAGE);
   const [languageOpen, setLanguageOpen] = useState(false);
@@ -1012,7 +1051,7 @@ function App() {
       const snapshot = (await browser.tabs.sendMessage(tab.id, {
         type: COMMENT_MESSAGES.getSnapshot,
         sortOrder: sortOrderRef.current,
-        hideFilteredComments: hideFilteredRef.current,
+        hideFilteredComments: !showSpamRef.current,
       })) as CommentsSnapshot;
 
       setState({ kind: 'ready', snapshot, tabId: tab.id });
@@ -1025,11 +1064,12 @@ function App() {
 
   useEffect(() => {
     void browser.storage.local
-      .get([AUTO_SUMMARIZE_KEY, HIDE_FILTERED_KEY])
+      .get([AUTO_SUMMARIZE_KEY, SHOW_SPAM_KEY, DEBUG_REPLIES_KEY])
       .then((stored) => {
-        const hide = stored[HIDE_FILTERED_KEY] === true;
-        hideFilteredRef.current = hide;
-        setHideFiltered(hide);
+        const show = stored[SHOW_SPAM_KEY] === true;
+        showSpamRef.current = show;
+        setShowSpam(show);
+        setDebugReplies(stored[DEBUG_REPLIES_KEY] === true);
         setAutoSummarize(stored[AUTO_SUMMARIZE_KEY] === true);
         settingsReady.current = true;
         void loadSnapshot(true);
@@ -1470,7 +1510,7 @@ function App() {
 
     const { snapshot, tabId } = state;
     const spamHidden =
-      hideFilteredRef.current &&
+      !showSpamRef.current &&
       state.snapshot.fetchedAll &&
       !state.snapshot.truncated;
     setExportKind(kind);
@@ -1695,7 +1735,7 @@ function App() {
             offset,
             limit: Math.min(MAX_COMMENT_PAGE_THREADS, limit - offset),
             sortOrder: order,
-            hideFilteredComments: hideFilteredRef.current,
+            hideFilteredComments: !showSpamRef.current,
           })) as CommentsPageResponse;
           if (response.videoId !== state.snapshot.videoId) return;
           if (response.sortOrder !== sortOrderRef.current) return;
@@ -1716,7 +1756,7 @@ function App() {
     if (state.kind !== 'ready') return;
     // A snapshot that started before the switch moved still carries the old
     // filter. Applying it would put the hidden comments back on screen.
-    if (state.snapshot.hideFilteredComments !== hideFilteredRef.current) {
+    if (state.snapshot.hideFilteredComments !== !showSpamRef.current) {
       void refreshVisibleComments(visibleCountRef.current);
       return;
     }
@@ -1728,7 +1768,7 @@ function App() {
       return;
     }
     setPageComments(state.snapshot.comments);
-  }, [state, refreshVisibleComments, hideFiltered]);
+  }, [state, refreshVisibleComments, showSpam]);
 
   const loadMoreComments = useCallback(async () => {
     if (state.kind !== 'ready' || loadingMoreRef.current) return;
@@ -1745,7 +1785,7 @@ function App() {
         offset: visible,
         limit: pageSize,
         sortOrder: sortOrderRef.current,
-        hideFilteredComments: hideFilteredRef.current,
+        hideFilteredComments: !showSpamRef.current,
       })) as CommentsPageResponse;
 
       if (response.videoId !== state.snapshot.videoId) return;
@@ -1792,13 +1832,99 @@ function App() {
     state.snapshot.fetchedAll &&
     state.snapshot.truncated;
   const isBusy = isLoadingAll || summaryState.kind === 'working' || chatSending;
-  const toggleHideSpam = () => {
-    const next = !hideFiltered;
-    hideFilteredRef.current = next;
-    setHideFiltered(next);
-    setVisibleCount(COMMENTS_PAGE_SIZE);
-    void setHideFilteredComments(next);
+  const formatDiagnostics = (report: {
+    videoId?: string | null;
+    fetchedAll?: boolean;
+    truncated?: boolean;
+    capturedCount?: number;
+    totalCommentsLabel?: string | null;
+    showSpam?: boolean;
+    canFilter?: boolean;
+    extrasHidden?: number;
+    threads?: Array<Record<string, unknown>>;
+  }) => {
+    const lines = [
+      `video=${report.videoId ?? ''}`,
+      `loaded=${report.capturedCount ?? 0} header=${report.totalCommentsLabel ?? ''}`,
+      `fetchedAll=${report.fetchedAll} truncated=${report.truncated}`,
+      `showSpam=${report.showSpam} canFilter=${report.canFilter} extrasHidden=${report.extrasHidden}`,
+      'author\tbutton\ttoolbar\tloaded\ttopServed\tnewestOnly\tkeptOff\thiddenOff\tparentFeatured',
+    ];
+    for (const thread of report.threads ?? []) {
+      lines.push(
+        [
+          thread.author,
+          thread.button,
+          thread.toolbar,
+          thread.loaded,
+          thread.topServed,
+          thread.newestOnly,
+          thread.keptOff,
+          thread.hiddenOff,
+          thread.parentFeatured,
+        ].join('\t'),
+      );
+    }
+    return lines.join('\n');
+  };
 
+  const refreshDiagnostics = async (): Promise<string> => {
+    if (state.kind !== 'ready') {
+      const message = 'Open a YouTube video first.';
+      setDiagnosticsText(message);
+      return message;
+    }
+    try {
+      const report = (await browser.tabs.sendMessage(state.tabId, {
+        type: COMMENT_MESSAGES.getReplyDiagnostics,
+        limit: 12,
+      })) as {
+        videoId?: string | null;
+        fetchedAll?: boolean;
+        truncated?: boolean;
+        capturedCount?: number;
+        totalCommentsLabel?: string | null;
+        showSpam?: boolean;
+        canFilter?: boolean;
+        extrasHidden?: number;
+        threads?: Array<Record<string, unknown>>;
+      };
+      const text = formatDiagnostics(report);
+      setDiagnosticsText(text);
+      return text;
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Could not read diagnostics.';
+      setDiagnosticsText(message);
+      return message;
+    }
+  };
+
+  const toggleDebugReplies = () => {
+    const next = !debugReplies;
+    setDebugReplies(next);
+    void setDebugRepliesEnabled(next);
+    if (next) void refreshDiagnostics();
+    else setDiagnosticsText('');
+  };
+
+  const copyDiagnostics = async () => {
+    const text = diagnosticsText.trim() ? diagnosticsText : await refreshDiagnostics();
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Clipboard may be denied; the report stays visible to select manually.
+    }
+  };
+
+  const toggleShowSpam = () => {
+    const next = !showSpam;
+    showSpamRef.current = next;
+    setShowSpam(next);
+    setVisibleCount(COMMENTS_PAGE_SIZE);
+    void setShowSpamComments(next);
+
+    // Turning Show spam on needs the Newest extras, so start a full load.
     const needsFetch =
       next &&
       state.kind === 'ready' &&
@@ -2158,14 +2284,19 @@ function App() {
                     pageComments={pageComments}
                     visibleCount={visibleCount}
                     sortOrder={sortOrder}
-                    hideFiltered={hideFiltered}
+                    showSpam={showSpam}
                     threadError={threadError}
                     isLoadingAll={isLoadingAll}
                     isBusy={isBusy}
                     filterUnavailable={filterUnavailable}
                     exportKind={exportKind}
                     onSortChange={changeSortOrder}
-                    onToggleHideSpam={toggleHideSpam}
+                    onToggleShowSpam={toggleShowSpam}
+                    debugReplies={debugReplies}
+                    diagnosticsText={diagnosticsText}
+                    onToggleDebugReplies={toggleDebugReplies}
+                    onRefreshDiagnostics={() => void refreshDiagnostics()}
+                    onCopyDiagnostics={() => void copyDiagnostics()}
                     onExport={(kind) => void exportComments(kind)}
                     onLoadAll={handleLoadAll}
                     onLoadMore={() => void loadMoreComments()}
